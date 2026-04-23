@@ -1,5 +1,6 @@
 # Root documentation/instructions
-/*.md
+/AGENTS.md
+/TODO.md
 
 # Visual Studio / MSBuild artifacts
 .vs/
