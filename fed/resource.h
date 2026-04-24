@@ -1,5 +1,12 @@
 #pragma once
 
+#define FED_VERSION_MAJOR 0
+#define FED_VERSION_MINOR 2
+#define FED_VERSION_PATCH 1
+#define FED_VERSION_BUILD 0
+#define FED_VERSION_STRING "0.2.1"
+#define FED_VERSION_STRING_W L"0.2.1"
+
 #define IDI_APP_ICON 100
 #define IDR_MAINMENU 101
 #define IDR_ACCELERATORS 102

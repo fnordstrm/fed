@@ -3,6 +3,7 @@
 #include <commdlg.h>
 #include <dwmapi.h>
 #include <ole2.h>
+#include <shellapi.h>
 #include <uxtheme.h>
 
 #include <algorithm>
@@ -25,6 +26,7 @@ constexpr int kDefaultEditorFontSize = 11;
 constexpr int kMinLineNumberDigits = 3;
 constexpr int kStatusHeight = 24;
 constexpr int kLineNumberSpacerWidth = 6;
+constexpr ULONGLONG kMaxDroppedFileBytes = 64ull * 1024ull * 1024ull;
 constexpr COLORREF kDarkEditorBack = RGB(40, 44, 52);
 constexpr COLORREF kDarkEditorFore = RGB(220, 223, 228);
 constexpr COLORREF kDarkGutterBack = RGB(46, 50, 58);
@@ -226,6 +228,22 @@ bool IsDarkModeEnabledByOs() {
     }
 
     return false;
+}
+
+bool TryGetFileSize(const std::wstring &path, ULONGLONG *sizeBytes) {
+    WIN32_FILE_ATTRIBUTE_DATA attributes = {};
+    if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &attributes)) {
+        return false;
+    }
+    if ((attributes.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        return false;
+    }
+
+    ULARGE_INTEGER size = {};
+    size.HighPart = attributes.nFileSizeHigh;
+    size.LowPart = attributes.nFileSizeLow;
+    *sizeBytes = size.QuadPart;
+    return true;
 }
 
 bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring *errorMessage) {
@@ -592,8 +610,19 @@ private:
         switch (message) {
         case WM_CREATE:
             return OnCreate() ? 0 : -1;
+        case WM_SETFOCUS:
+            RestoreEditorFocus();
+            return 0;
+        case WM_ACTIVATE:
+            if (LOWORD(wParam) != WA_INACTIVE) {
+                RestoreEditorFocus();
+            }
+            return 0;
         case WM_SIZE:
             LayoutChildren();
+            return 0;
+        case WM_DROPFILES:
+            OnDropFiles(reinterpret_cast<HDROP>(wParam));
             return 0;
         case WM_COMMAND:
             OnCommand(LOWORD(wParam));
@@ -676,6 +705,12 @@ private:
         LayoutChildren();
         ::SetFocus(editor_);
         return true;
+    }
+
+    void RestoreEditorFocus() {
+        if (editor_ != nullptr && ::GetFocus() != editor_) {
+            ::SetFocus(editor_);
+        }
     }
 
     void OnCommand(int commandId) {
@@ -767,6 +802,46 @@ private:
             break;
         default:
             break;
+        }
+    }
+
+    void OnDropFiles(HDROP dropHandle) {
+        if (dropHandle == nullptr) {
+            return;
+        }
+
+        const UINT fileCount = ::DragQueryFileW(dropHandle, 0xFFFFFFFF, nullptr, 0);
+        if (fileCount != 1) {
+            ::DragFinish(dropHandle);
+            ::MessageBoxW(window_, L"Please drop exactly one file.", kAppName, MB_ICONWARNING | MB_OK);
+            return;
+        }
+
+        const UINT pathLength = ::DragQueryFileW(dropHandle, 0, nullptr, 0);
+        std::vector<wchar_t> pathBuffer(pathLength + 1, L'\0');
+        if (::DragQueryFileW(dropHandle, 0, pathBuffer.data(), pathLength + 1) == 0) {
+            ::DragFinish(dropHandle);
+            ::MessageBoxW(window_, L"Unable to read the dropped file path.", kAppName, MB_ICONERROR | MB_OK);
+            return;
+        }
+        ::DragFinish(dropHandle);
+
+        const std::wstring path(pathBuffer.data());
+        ULONGLONG sizeBytes = 0;
+        if (!TryGetFileSize(path, &sizeBytes)) {
+            std::wstring message = L"Unable to inspect dropped file:\n\n" + path;
+            ::MessageBoxW(window_, message.c_str(), kAppName, MB_ICONERROR | MB_OK);
+            return;
+        }
+        if (sizeBytes > kMaxDroppedFileBytes) {
+            std::wstring message =
+                L"Dropped files larger than 64 MiB are not supported:\n\n" + path;
+            ::MessageBoxW(window_, message.c_str(), kAppName, MB_ICONWARNING | MB_OK);
+            return;
+        }
+
+        if (ConfirmDiscardChanges()) {
+            OpenDocument(path);
         }
     }
 
@@ -1133,8 +1208,8 @@ private:
 
     void ShowAboutDialog() {
         std::wstring message =
-            L"fed 0.2.0\n\n"
-            L"A minimalist Win32 text editor built on Scintilla.\n";
+            std::wstring(L"fed ") + FED_VERSION_STRING_W + L"\n\n"
+            L"A minimalist Win32 editor built on Scintilla.\n";
         ::MessageBoxW(window_, message.c_str(), L"About fed", MB_OK | MB_ICONINFORMATION);
     }
 
