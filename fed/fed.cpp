@@ -1,9 +1,9 @@
 #include <windows.h>
 #include <commctrl.h>
-#include <commdlg.h>
 #include <dwmapi.h>
 #include <ole2.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
 
 #include <algorithm>
@@ -22,10 +22,25 @@ namespace {
 
 constexpr wchar_t kAppName[] = L"fed";
 constexpr wchar_t kWindowClassName[] = L"fed.MainWindow";
+constexpr wchar_t kSearchWindowClassName[] = L"fed.SearchWindow";
 constexpr int kDefaultEditorFontSize = 11;
 constexpr int kMinLineNumberDigits = 3;
 constexpr int kStatusHeight = 24;
 constexpr int kLineNumberSpacerWidth = 6;
+constexpr int kSearchIndicator = 8;
+constexpr int kSearchDialogWidth = 475;
+constexpr int kFindDialogHeight = 190;
+constexpr int kReplaceDialogHeight = 230;
+constexpr int kSearchTextId = 5001;
+constexpr int kReplaceTextId = 5002;
+constexpr int kMatchCaseId = 5003;
+constexpr int kWholeWordId = 5004;
+constexpr int kFindNextId = 5005;
+constexpr int kFindPreviousId = 5006;
+constexpr int kReplaceButtonId = 5007;
+constexpr int kReplaceAllButtonId = 5008;
+constexpr int kCloseSearchId = 5009;
+constexpr int kOccurrenceLabelId = 5010;
 constexpr ULONGLONG kMaxDroppedFileBytes = 64ull * 1024ull * 1024ull;
 constexpr COLORREF kDarkEditorBack = RGB(40, 44, 52);
 constexpr COLORREF kDarkEditorFore = RGB(220, 223, 228);
@@ -41,6 +56,9 @@ constexpr COLORREF kLightGutterFore = RGB(120, 120, 120);
 constexpr COLORREF kLightSelectionBack = RGB(201, 221, 245);
 constexpr COLORREF kLightCurrentLineBack = RGB(248, 248, 248);
 constexpr COLORREF kLightCaretFore = RGB(0, 0, 0);
+constexpr COLORREF kSearchHighlight = RGB(255, 210, 80);
+constexpr COLORREF kDarkDialogBack = RGB(32, 36, 42);
+constexpr COLORREF kDarkControlBack = RGB(43, 47, 54);
 constexpr COLORREF kChromeBlue = RGB(86, 129, 168);
 constexpr COLORREF kLightStatusBarBack = RGB(180, 205, 230);
 constexpr COLORREF kChromeText = RGB(25, 33, 41);
@@ -51,6 +69,11 @@ enum class StyleMode {
     System,
     Light,
     Dark,
+};
+
+enum class SearchDialogMode {
+    Find,
+    Replace,
 };
 
 struct EditorPalette {
@@ -87,31 +110,20 @@ EditorPalette PaletteForDarkMode(bool darkModeEnabled) {
     };
 }
 
-class DarkModeSupport {
-public:
-    void Initialize(bool) const {}
-
-    void ApplyAppMode(bool) const {}
-
-    void ApplyWindowTheme(HWND window, bool darkModeEnabled) const {
-        if (window == nullptr) {
-            return;
-        }
-
-        const BOOL useDarkMode = darkModeEnabled ? TRUE : FALSE;
-        if (FAILED(::DwmSetWindowAttribute(
-                window,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &useDarkMode,
-                sizeof(useDarkMode)))) {
-            constexpr DWORD legacyDarkModeAttribute = 19;
-            ::DwmSetWindowAttribute(window, legacyDarkModeAttribute, &useDarkMode, sizeof(useDarkMode));
-        }
+void ApplyImmersiveDarkMode(HWND window, bool darkModeEnabled) {
+    if (window == nullptr) {
+        return;
     }
-};
 
-COLORREF RgbFromColorRef(COLORREF color) {
-    return RGB(GetRValue(color), GetGValue(color), GetBValue(color));
+    const BOOL useDarkMode = darkModeEnabled ? TRUE : FALSE;
+    if (FAILED(::DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &useDarkMode,
+            sizeof(useDarkMode)))) {
+        constexpr DWORD legacyDarkModeAttribute = 19;
+        ::DwmSetWindowAttribute(window, legacyDarkModeAttribute, &useDarkMode, sizeof(useDarkMode));
+    }
 }
 
 std::wstring Utf8ToWide(std::string_view text) {
@@ -165,7 +177,7 @@ std::wstring BytesToWide(UINT codePage, DWORD flags, std::string_view bytes) {
     return wide;
 }
 
-std::string SystemMessage(DWORD error) {
+std::wstring SystemMessageWide(DWORD error) {
     wchar_t *buffer = nullptr;
     const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
         FORMAT_MESSAGE_IGNORE_INSERTS;
@@ -182,9 +194,46 @@ std::string SystemMessage(DWORD error) {
         ::LocalFree(buffer);
     }
     if (message.empty()) {
-        return "Unknown error";
+        return L"Unknown error";
     }
-    return WideToUtf8(message);
+    return message;
+}
+
+void SetSystemErrorMessage(DWORD error, std::wstring *errorMessage) {
+    *errorMessage = SystemMessageWide(error);
+}
+
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = INVALID_HANDLE_VALUE) : handle_(handle) {}
+
+    UniqueHandle(const UniqueHandle &) = delete;
+    UniqueHandle &operator=(const UniqueHandle &) = delete;
+
+    ~UniqueHandle() {
+        if (IsValid()) {
+            ::CloseHandle(handle_);
+        }
+    }
+
+    bool IsValid() const {
+        return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr;
+    }
+
+    HANDLE Get() const {
+        return handle_;
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+std::wstring DirectoryFromPath(const std::wstring &path) {
+    const size_t separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return {};
+    }
+    return path.substr(0, separator);
 }
 
 std::wstring FileNameFromPath(const std::wstring &path) {
@@ -247,30 +296,27 @@ bool TryGetFileSize(const std::wstring &path, ULONGLONG *sizeBytes) {
 }
 
 bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring *errorMessage) {
-    HANDLE file = ::CreateFileW(
-        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+    UniqueHandle file(::CreateFileW(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.IsValid()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
     LARGE_INTEGER fileSize = {};
-    if (!::GetFileSizeEx(file, &fileSize)) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
-        ::CloseHandle(file);
+    if (!::GetFileSizeEx(file.Get(), &fileSize)) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
     if (fileSize.QuadPart < 0) {
         *errorMessage = L"File is too large to open.";
-        ::CloseHandle(file);
         return false;
     }
 
     const ULONGLONG byteCount = static_cast<ULONGLONG>(fileSize.QuadPart);
     if (byteCount > static_cast<ULONGLONG>((std::numeric_limits<size_t>::max)())) {
         *errorMessage = L"File is too large to open.";
-        ::CloseHandle(file);
         return false;
     }
 
@@ -280,15 +326,14 @@ bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring 
     while (ok && totalRead < contents->size()) {
         const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(contents->size() - totalRead, 1u << 20));
         DWORD read = 0;
-        ok = ::ReadFile(file, contents->data() + totalRead, chunkSize, &read, nullptr);
+        ok = ::ReadFile(file.Get(), contents->data() + totalRead, chunkSize, &read, nullptr);
         totalRead += read;
         if (read == 0) {
             break;
         }
     }
-    ::CloseHandle(file);
     if (!ok) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
     contents->resize(totalRead);
@@ -296,10 +341,10 @@ bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring 
 }
 
 bool WriteAllBytes(const std::wstring &path, const std::string &contents, std::wstring *errorMessage) {
-    HANDLE file = ::CreateFileW(
-        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+    UniqueHandle file(::CreateFileW(
+        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.IsValid()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
@@ -308,19 +353,21 @@ bool WriteAllBytes(const std::wstring &path, const std::string &contents, std::w
     while (ok && totalWritten < contents.size()) {
         const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(contents.size() - totalWritten, 1u << 20));
         DWORD written = 0;
-        ok = ::WriteFile(file, contents.data() + totalWritten, chunkSize, &written, nullptr);
+        ok = ::WriteFile(file.Get(), contents.data() + totalWritten, chunkSize, &written, nullptr);
         totalWritten += written;
         if (written == 0) {
             break;
         }
     }
     if (!ok || totalWritten != contents.size()) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
-        ::CloseHandle(file);
+        if (!ok) {
+            SetSystemErrorMessage(::GetLastError(), errorMessage);
+        } else {
+            *errorMessage = L"Unable to write the complete file.";
+        }
         return false;
     }
 
-    ::CloseHandle(file);
     return true;
 }
 
@@ -414,6 +461,15 @@ HFONT CreateUiFont(const std::wstring &faceName, int pointSize, int weight) {
     return font;
 }
 
+HFONT CreateMessageFont() {
+    NONCLIENTMETRICSW metrics = {};
+    metrics.cbSize = sizeof(metrics);
+    if (::SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+        return ::CreateFontIndirectW(&metrics.lfMessageFont);
+    }
+    return static_cast<HFONT>(::GetStockObject(DEFAULT_GUI_FONT));
+}
+
 HICON LoadAppIcon(HINSTANCE instance, bool useSmallIcon) {
     const int width = ::GetSystemMetrics(useSmallIcon ? SM_CXSMICON : SM_CXICON);
     const int height = ::GetSystemMetrics(useSmallIcon ? SM_CYSMICON : SM_CYICON);
@@ -458,6 +514,11 @@ struct LoadedDocument {
     bool hadUtf8Bom = false;
 };
 
+struct MatchRange {
+    sptr_t start = 0;
+    sptr_t end = 0;
+};
+
 class FedWindow {
 public:
     explicit FedWindow(HINSTANCE instance) : instance_(instance) {}
@@ -472,12 +533,12 @@ public:
 
         editorFontFace_ = SelectEditorFont();
         statusFont_ = CreateUiFont(editorFontFace_, 11, FW_NORMAL);
+        searchFont_ = CreateMessageFont();
         darkModeEnabled_ = ResolveDarkModeEnabled();
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
         frameBrush_ = ::CreateSolidBrush(palette.back);
         statusBrush_ = ::CreateSolidBrush(CurrentStatusBarBackColor());
-        darkModeSupport_.Initialize(darkModeEnabled_);
-
+        UpdateSearchBrushes();
         if (!::Scintilla_RegisterClasses(instance_)) {
             ::MessageBoxW(nullptr, L"Failed to register Scintilla window classes.", kAppName, MB_ICONERROR | MB_OK);
             DestroyUiResources();
@@ -500,6 +561,9 @@ public:
 
         MSG message = {};
         while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
+            if (ProcessModelessMessage(&message)) {
+                continue;
+            }
             if (accelerator_ == nullptr || !::TranslateAcceleratorW(window_, accelerator_, &message)) {
                 ::TranslateMessage(&message);
                 ::DispatchMessageW(&message);
@@ -521,11 +585,24 @@ private:
     HACCEL accelerator_ = nullptr;
     HBRUSH statusBrush_ = nullptr;
     HBRUSH frameBrush_ = nullptr;
+    HBRUSH searchBrush_ = nullptr;
+    HBRUSH searchEditBrush_ = nullptr;
     HFONT statusFont_ = nullptr;
+    HFONT searchFont_ = nullptr;
     std::wstring currentPath_;
     std::wstring editorFontFace_;
-    DarkModeSupport darkModeSupport_;
-    int preferredEolMode_ = SC_EOL_CRLF;
+    HWND findWindow_ = nullptr;
+    HWND replaceWindow_ = nullptr;
+    std::wstring searchText_;
+    std::wstring replaceText_;
+    std::vector<MatchRange> searchMatches_;
+    int currentMatchIndex_ = -1;
+    bool searchMatchCase_ = false;
+    bool searchWholeWord_ = false;
+    bool searchIndicatorConfigured_ = false;
+    bool updatingSearchControls_ = false;
+    bool suppressSearchRefresh_ = false;
+    bool switchingSearchWindow_ = false;
     bool writeUtf8Bom_ = false;
     StyleMode styleMode_ = StyleMode::System;
     bool darkModeEnabled_ = false;
@@ -564,6 +641,23 @@ private:
         return ::RegisterClassExW(&windowClass) != 0;
     }
 
+    bool RegisterSearchClass() {
+        WNDCLASSEXW windowClass = {};
+        windowClass.cbSize = sizeof(windowClass);
+        windowClass.lpfnWndProc = SearchWindowProc;
+        windowClass.hInstance = instance_;
+        windowClass.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+        windowClass.hIcon = LoadAppIcon(instance_, false);
+        windowClass.hIconSm = LoadAppIcon(instance_, true);
+        windowClass.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        windowClass.lpszClassName = kSearchWindowClassName;
+
+        if (::RegisterClassExW(&windowClass) != 0) {
+            return true;
+        }
+        return ::GetLastError() == ERROR_CLASS_ALREADY_EXISTS;
+    }
+
     bool CreateMainWindow(int showCommand) {
         const DWORD style = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         const DWORD exStyle = WS_EX_ACCEPTFILES;
@@ -592,9 +686,23 @@ private:
     }
 
     void DestroyUiResources() {
+        DestroySearchWindow(findWindow_);
+        DestroySearchWindow(replaceWindow_);
+        if (searchFont_ != nullptr && searchFont_ != ::GetStockObject(DEFAULT_GUI_FONT)) {
+            ::DeleteObject(searchFont_);
+            searchFont_ = nullptr;
+        }
         if (statusFont_ != nullptr) {
             ::DeleteObject(statusFont_);
             statusFont_ = nullptr;
+        }
+        if (searchEditBrush_ != nullptr) {
+            ::DeleteObject(searchEditBrush_);
+            searchEditBrush_ = nullptr;
+        }
+        if (searchBrush_ != nullptr) {
+            ::DeleteObject(searchBrush_);
+            searchBrush_ = nullptr;
         }
         if (statusBrush_ != nullptr) {
             ::DeleteObject(statusBrush_);
@@ -604,6 +712,41 @@ private:
             ::DeleteObject(frameBrush_);
             frameBrush_ = nullptr;
         }
+    }
+
+    bool ProcessModelessMessage(MSG *message) {
+        if (message->message == WM_KEYDOWN) {
+            if (message->wParam == VK_ESCAPE && IsSearchWindow(message->hwnd)) {
+                ::DestroyWindow(::GetAncestor(message->hwnd, GA_ROOT));
+                return true;
+            }
+            if (message->wParam == VK_RETURN && IsSearchWindow(message->hwnd)) {
+                HWND restoreFocus = message->hwnd;
+                SelectSearchMatch(true);
+                if (restoreFocus != nullptr && ::IsWindow(restoreFocus)) {
+                    ::SetFocus(restoreFocus);
+                }
+                return true;
+            }
+            if (message->wParam == VK_F3) {
+                const bool previous = (::GetKeyState(VK_SHIFT) & 0x8000) != 0;
+                SelectSearchMatch(!previous);
+                return true;
+            }
+        }
+
+        if (findWindow_ != nullptr && ::IsWindow(findWindow_) && ::IsDialogMessageW(findWindow_, message)) {
+            return true;
+        }
+        if (replaceWindow_ != nullptr && ::IsWindow(replaceWindow_) && ::IsDialogMessageW(replaceWindow_, message)) {
+            return true;
+        }
+        return false;
+    }
+
+    bool IsSearchWindow(HWND window) const {
+        return (findWindow_ != nullptr && (::IsChild(findWindow_, window) || findWindow_ == window)) ||
+            (replaceWindow_ != nullptr && (::IsChild(replaceWindow_, window) || replaceWindow_ == window));
     }
 
     LRESULT HandleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
@@ -658,6 +801,62 @@ private:
             break;
         }
         return ::DefWindowProcW(window_, message, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK SearchWindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        FedWindow *self = nullptr;
+        if (message == WM_NCCREATE) {
+            auto *create = reinterpret_cast<CREATESTRUCTW *>(lParam);
+            self = static_cast<FedWindow *>(create->lpCreateParams);
+            ::SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(self));
+        } else {
+            self = reinterpret_cast<FedWindow *>(::GetWindowLongPtrW(window, GWLP_USERDATA));
+        }
+
+        if (self != nullptr) {
+            return self->HandleSearchWindowMessage(window, message, wParam, lParam);
+        }
+        return ::DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    LRESULT HandleSearchWindowMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_COMMAND:
+            HandleSearchCommand(window, LOWORD(wParam), HIWORD(wParam), reinterpret_cast<HWND>(lParam));
+            return 0;
+        case WM_ERASEBKGND: {
+            RECT client = {};
+            ::GetClientRect(window, &client);
+            ::FillRect(reinterpret_cast<HDC>(wParam), &client, searchBrush_);
+            return 1;
+        }
+        case WM_CTLCOLORDLG:
+            return reinterpret_cast<LRESULT>(searchBrush_);
+        case WM_CTLCOLORSTATIC: {
+            HDC dc = reinterpret_cast<HDC>(wParam);
+            ::SetTextColor(dc, CurrentDialogTextColor());
+            ::SetBkMode(dc, TRANSPARENT);
+            return reinterpret_cast<LRESULT>(searchBrush_);
+        }
+        case WM_CTLCOLOREDIT:
+            if (darkModeEnabled_) {
+                HDC dc = reinterpret_cast<HDC>(wParam);
+                ::SetTextColor(dc, kDarkEditorFore);
+                ::SetBkColor(dc, kDarkControlBack);
+                return reinterpret_cast<LRESULT>(searchEditBrush_);
+            }
+            break;
+        case WM_CLOSE:
+            ::DestroyWindow(window);
+            return 0;
+        case WM_DESTROY:
+            OnSearchWindowDestroyed(window);
+            return 0;
+        default:
+            break;
+        }
+
+        return ::DefWindowProcW(window, message, wParam, lParam);
     }
 
     bool OnCreate() {
@@ -759,6 +958,18 @@ private:
                     EditorSend(SCI_DELETERANGE, currentPosition, 1);
                 }
             }
+            break;
+        case ID_EDIT_FIND:
+            ShowSearchWindow(SearchDialogMode::Find);
+            break;
+        case ID_EDIT_REPLACE:
+            ShowSearchWindow(SearchDialogMode::Replace);
+            break;
+        case ID_EDIT_FIND_NEXT:
+            SelectSearchMatch(true);
+            break;
+        case ID_EDIT_FIND_PREVIOUS:
+            SelectSearchMatch(false);
             break;
         case ID_EDIT_SELECT_ALL:
             EditorSend(SCI_SELECTALL);
@@ -873,6 +1084,9 @@ private:
 
         if (header->code == SCN_MODIFIED) {
             UpdateLineNumberMargin();
+            if (!suppressSearchRefresh_) {
+                RefreshSearchMatches();
+            }
             UpdateStatusBar();
             return 0;
         }
@@ -899,6 +1113,8 @@ private:
         setState(ID_EDIT_COPY, hasSelection);
         setState(ID_EDIT_DELETE, canDelete);
         setState(ID_EDIT_PASTE, canPaste);
+        setState(ID_EDIT_FIND, true);
+        setState(ID_EDIT_REPLACE, true);
         UpdateMenuChecks();
     }
 
@@ -917,6 +1133,7 @@ private:
         EditorSend(SCI_SETMARGINSENSITIVEN, 1, 0);
         EditorSend(SCI_SETSCROLLWIDTHTRACKING, 1);
         EditorSend(SCI_SETMODEVENTMASK, SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT);
+        ConfigureSearchIndicator();
         ApplyEditorAppearance();
         ApplyWordWrap();
         UpdateLineNumberMargin();
@@ -938,6 +1155,14 @@ private:
         return darkModeEnabled_ ? kChromeBlue : kLightStatusBarBack;
     }
 
+    COLORREF CurrentDialogBackColor() const {
+        return darkModeEnabled_ ? kDarkDialogBack : ::GetSysColor(COLOR_WINDOW);
+    }
+
+    COLORREF CurrentDialogTextColor() const {
+        return darkModeEnabled_ ? kDarkEditorFore : ::GetSysColor(COLOR_WINDOWTEXT);
+    }
+
     void UpdateStatusBrush() {
         HBRUSH nextBrush = ::CreateSolidBrush(CurrentStatusBarBackColor());
         HBRUSH oldBrush = statusBrush_;
@@ -948,6 +1173,42 @@ private:
         if (oldBrush != nullptr) {
             ::DeleteObject(oldBrush);
         }
+    }
+
+    void UpdateSearchBrushes() {
+        HBRUSH nextBrush = ::CreateSolidBrush(CurrentDialogBackColor());
+        HBRUSH nextEditBrush = ::CreateSolidBrush(darkModeEnabled_ ? kDarkControlBack : ::GetSysColor(COLOR_WINDOW));
+        HBRUSH oldBrush = searchBrush_;
+        HBRUSH oldEditBrush = searchEditBrush_;
+        searchBrush_ = nextBrush;
+        searchEditBrush_ = nextEditBrush;
+        if (findWindow_ != nullptr) {
+            ::InvalidateRect(findWindow_, nullptr, TRUE);
+        }
+        if (replaceWindow_ != nullptr) {
+            ::InvalidateRect(replaceWindow_, nullptr, TRUE);
+        }
+        if (oldBrush != nullptr) {
+            ::DeleteObject(oldBrush);
+        }
+        if (oldEditBrush != nullptr) {
+            ::DeleteObject(oldEditBrush);
+        }
+    }
+
+    void ApplySearchWindowTheme(HWND window) {
+        if (window == nullptr || !::IsWindow(window)) {
+            return;
+        }
+
+        const wchar_t *themeClass = darkModeEnabled_ ? kDarkThemeClassName : kLightThemeClassName;
+        ApplyImmersiveDarkMode(window, darkModeEnabled_);
+        ::SetWindowTheme(window, themeClass, nullptr);
+        for (HWND child = ::GetWindow(window, GW_CHILD); child != nullptr; child = ::GetWindow(child, GW_HWNDNEXT)) {
+            ::SetWindowTheme(child, themeClass, nullptr);
+            ::InvalidateRect(child, nullptr, TRUE);
+        }
+        ::InvalidateRect(window, nullptr, TRUE);
     }
 
     void UpdateFrameBrush() {
@@ -972,27 +1233,27 @@ private:
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
         const std::string fontName = WideToUtf8(editorFontFace_);
 
-        EditorSend(SCI_STYLESETFORE, STYLE_DEFAULT, RgbFromColorRef(palette.fore));
-        EditorSend(SCI_STYLESETBACK, STYLE_DEFAULT, RgbFromColorRef(palette.back));
+        EditorSend(SCI_STYLESETFORE, STYLE_DEFAULT, palette.fore);
+        EditorSend(SCI_STYLESETBACK, STYLE_DEFAULT, palette.back);
         EditorSend(SCI_STYLESETSIZE, STYLE_DEFAULT, kDefaultEditorFontSize);
         EditorSend(SCI_STYLESETFONT, STYLE_DEFAULT, reinterpret_cast<sptr_t>(fontName.c_str()));
         EditorSend(SCI_STYLECLEARALL);
 
-        EditorSend(SCI_STYLESETFORE, STYLE_LINENUMBER, RgbFromColorRef(palette.gutterFore));
-        EditorSend(SCI_STYLESETBACK, STYLE_LINENUMBER, RgbFromColorRef(palette.gutterBack));
-        EditorSend(SCI_SETMARGINBACKN, 1, RgbFromColorRef(palette.back));
+        EditorSend(SCI_STYLESETFORE, STYLE_LINENUMBER, palette.gutterFore);
+        EditorSend(SCI_STYLESETBACK, STYLE_LINENUMBER, palette.gutterBack);
+        EditorSend(SCI_SETMARGINBACKN, 1, palette.back);
 
-        EditorSend(SCI_SETSELFORE, 1, RgbFromColorRef(palette.fore));
-        EditorSend(SCI_SETSELBACK, 1, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETCARETFORE, RgbFromColorRef(palette.caretFore));
+        EditorSend(SCI_SETSELFORE, 1, palette.fore);
+        EditorSend(SCI_SETSELBACK, 1, palette.selectionBack);
+        EditorSend(SCI_SETCARETFORE, palette.caretFore);
         EditorSend(SCI_SETCARETLINEVISIBLE, 1);
-        EditorSend(SCI_SETCARETLINEBACK, RgbFromColorRef(palette.currentLineBack));
+        EditorSend(SCI_SETCARETLINEBACK, palette.currentLineBack);
         EditorSend(SCI_SETCARETLINEBACKALPHA, SC_ALPHA_NOALPHA);
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST, RgbFromColorRef(palette.back));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_BACK, RgbFromColorRef(palette.back));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED_BACK, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET_LINE_BACK, RgbFromColorRef(palette.currentLineBack));
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST, palette.back);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_BACK, palette.back);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED, palette.selectionBack);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED_BACK, palette.selectionBack);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET_LINE_BACK, palette.currentLineBack);
         ::InvalidateRect(editor_, nullptr, TRUE);
     }
 
@@ -1001,6 +1262,7 @@ private:
         darkModeEnabled_ = ResolveDarkModeEnabled();
         UpdateStatusBrush();
         UpdateFrameBrush();
+        UpdateSearchBrushes();
         ApplyDarkMode();
         ApplyEditorAppearance();
         UpdateStatusBar();
@@ -1013,9 +1275,8 @@ private:
         }
 
         applyingDarkMode_ = true;
-        darkModeSupport_.ApplyAppMode(darkModeEnabled_);
-        darkModeSupport_.ApplyWindowTheme(window_, darkModeEnabled_);
-        darkModeSupport_.ApplyWindowTheme(editor_, darkModeEnabled_);
+        ApplyImmersiveDarkMode(window_, darkModeEnabled_);
+        ApplyImmersiveDarkMode(editor_, darkModeEnabled_);
 
         const wchar_t *themeClass = darkModeEnabled_ ? kDarkThemeClassName : kLightThemeClassName;
         if (window_ != nullptr) {
@@ -1038,6 +1299,8 @@ private:
             ::SetWindowTheme(statusBar_, L"", L"");
             ::InvalidateRect(statusBar_, nullptr, TRUE);
         }
+        ApplySearchWindowTheme(findWindow_);
+        ApplySearchWindowTheme(replaceWindow_);
         applyingDarkMode_ = false;
     }
 
@@ -1054,6 +1317,7 @@ private:
         darkModeEnabled_ = nextDarkModeEnabled;
         UpdateStatusBrush();
         UpdateFrameBrush();
+        UpdateSearchBrushes();
         ApplyDarkMode();
         ApplyEditorAppearance();
         UpdateStatusBar();
@@ -1105,11 +1369,10 @@ private:
 
     void ResetToNewDocument() {
         currentPath_.clear();
-        preferredEolMode_ = SC_EOL_CRLF;
         writeUtf8Bom_ = false;
 
         EditorSend(SCI_SETTEXT, 0, reinterpret_cast<sptr_t>(""));
-        EditorSend(SCI_SETEOLMODE, preferredEolMode_);
+        EditorSend(SCI_SETEOLMODE, SC_EOL_CRLF);
         EditorSend(SCI_EMPTYUNDOBUFFER);
         EditorSend(SCI_SETSAVEPOINT);
         EditorSend(SCI_GOTOPOS, 0);
@@ -1131,11 +1394,10 @@ private:
         }
 
         EditorSend(SCI_SETTEXT, 0, reinterpret_cast<sptr_t>(document.utf8Text.c_str()));
-        preferredEolMode_ = document.eolMode;
         writeUtf8Bom_ = document.hadUtf8Bom;
         currentPath_ = path;
 
-        EditorSend(SCI_SETEOLMODE, preferredEolMode_);
+        EditorSend(SCI_SETEOLMODE, document.eolMode);
         EditorSend(SCI_EMPTYUNDOBUFFER);
         EditorSend(SCI_SETSAVEPOINT);
         EditorSend(SCI_GOTOPOS, 0);
@@ -1214,29 +1476,611 @@ private:
     }
 
     std::wstring PromptForPath(bool open) {
-        wchar_t buffer[MAX_PATH] = {};
+        IFileDialog *dialog = nullptr;
+        const CLSID dialogClass = open ? CLSID_FileOpenDialog : CLSID_FileSaveDialog;
+        HRESULT result = ::CoCreateInstance(
+            dialogClass,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&dialog));
+        if (FAILED(result)) {
+            return {};
+        }
+
+        constexpr COMDLG_FILTERSPEC filters[] = {
+            {L"Text Files (*.txt)", L"*.txt"},
+            {L"All Files (*.*)", L"*.*"},
+        };
+        dialog->SetFileTypes(ARRAYSIZE(filters), filters);
+        dialog->SetFileTypeIndex(1);
+        dialog->SetDefaultExtension(L"txt");
+
+        DWORD options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options))) {
+            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+            options |= open ? FOS_FILEMUSTEXIST : FOS_OVERWRITEPROMPT;
+            dialog->SetOptions(options);
+        }
+
         if (!currentPath_.empty()) {
-            wcsncpy_s(buffer, currentPath_.c_str(), _TRUNCATE);
+            const std::wstring directory = DirectoryFromPath(currentPath_);
+            if (!directory.empty()) {
+                IShellItem *folder = nullptr;
+                if (SUCCEEDED(::SHCreateItemFromParsingName(directory.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+                    dialog->SetFolder(folder);
+                    folder->Release();
+                }
+            }
+            dialog->SetFileName(FileNameFromPath(currentPath_).c_str());
         }
 
-        constexpr wchar_t filters[] =
-            L"Text Files (*.txt)\0*.txt\0"
-            L"All Files (*.*)\0*.*\0\0";
-
-        OPENFILENAMEW dialog = {};
-        dialog.lStructSize = sizeof(dialog);
-        dialog.hwndOwner = window_;
-        dialog.lpstrFilter = filters;
-        dialog.lpstrFile = buffer;
-        dialog.nMaxFile = MAX_PATH;
-        dialog.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
-        dialog.lpstrDefExt = L"txt";
-        if (open) {
-            dialog.Flags |= OFN_FILEMUSTEXIST;
-            return ::GetOpenFileNameW(&dialog) ? std::wstring(buffer) : std::wstring();
+        std::wstring path;
+        result = dialog->Show(window_);
+        if (SUCCEEDED(result)) {
+            IShellItem *item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item))) {
+                PWSTR filePath = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &filePath))) {
+                    path = filePath;
+                    ::CoTaskMemFree(filePath);
+                }
+                item->Release();
+            }
         }
-        dialog.Flags |= OFN_OVERWRITEPROMPT;
-        return ::GetSaveFileNameW(&dialog) ? std::wstring(buffer) : std::wstring();
+
+        dialog->Release();
+        return path;
+    }
+
+    HWND CreateSearchChild(
+        HWND parent,
+        const wchar_t *className,
+        const wchar_t *text,
+        DWORD style,
+        int id,
+        int x,
+        int y,
+        int width,
+        int height) {
+        HWND child = ::CreateWindowExW(
+            0,
+            className,
+            text,
+            WS_CHILD | WS_VISIBLE | style,
+            x,
+            y,
+            width,
+            height,
+            parent,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)),
+            instance_,
+            nullptr);
+        if (child != nullptr) {
+            ::SendMessageW(child, WM_SETFONT, reinterpret_cast<WPARAM>(searchFont_), TRUE);
+            ::SetWindowTheme(child, darkModeEnabled_ ? kDarkThemeClassName : kLightThemeClassName, nullptr);
+        }
+        return child;
+    }
+
+    void ShowSearchWindow(SearchDialogMode mode) {
+        switchingSearchWindow_ = true;
+        if (mode == SearchDialogMode::Find) {
+            DestroySearchWindow(replaceWindow_);
+        } else {
+            DestroySearchWindow(findWindow_);
+        }
+        switchingSearchWindow_ = false;
+
+        PrefillSearchFromSelection();
+
+        HWND &dialogWindow = mode == SearchDialogMode::Find ? findWindow_ : replaceWindow_;
+        if (dialogWindow != nullptr && ::IsWindow(dialogWindow)) {
+            ::ShowWindow(dialogWindow, SW_SHOWNORMAL);
+            ::SetForegroundWindow(dialogWindow);
+            HWND searchField = ::GetDlgItem(dialogWindow, kSearchTextId);
+            if (searchField != nullptr) {
+                ::SetFocus(searchField);
+                ::SendMessageW(searchField, EM_SETSEL, 0, -1);
+            }
+            return;
+        }
+
+        if (!RegisterSearchClass()) {
+            ::MessageBoxW(window_, L"Failed to register the search window class.", kAppName, MB_ICONERROR | MB_OK);
+            return;
+        }
+
+        const bool replaceMode = mode == SearchDialogMode::Replace;
+        const wchar_t *title = replaceMode ? L"Replace" : L"Find";
+        const int height = replaceMode ? kReplaceDialogHeight : kFindDialogHeight;
+        dialogWindow = ::CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            kSearchWindowClassName,
+            title,
+            WS_CAPTION | WS_SYSMENU,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            kSearchDialogWidth,
+            height,
+            window_,
+            nullptr,
+            instance_,
+            this);
+        if (dialogWindow == nullptr) {
+            ::MessageBoxW(window_, L"Failed to create the search window.", kAppName, MB_ICONERROR | MB_OK);
+            return;
+        }
+
+        BuildSearchWindow(dialogWindow, replaceMode);
+        ApplySearchWindowTheme(dialogWindow);
+        ::ShowWindow(dialogWindow, SW_SHOWNORMAL);
+        ::UpdateWindow(dialogWindow);
+        RefreshSearchMatches();
+
+        HWND searchField = ::GetDlgItem(dialogWindow, kSearchTextId);
+        if (searchField != nullptr) {
+            ::SetFocus(searchField);
+            ::SendMessageW(searchField, EM_SETSEL, 0, -1);
+        }
+    }
+
+    void BuildSearchWindow(HWND dialogWindow, bool replaceMode) {
+        updatingSearchControls_ = true;
+
+        CreateSearchChild(dialogWindow, WC_STATICW, L"Search string:", 0, -1, 16, 18, 105, 22);
+        CreateSearchChild(
+            dialogWindow,
+            WC_EDITW,
+            searchText_.c_str(),
+            WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER,
+            kSearchTextId,
+            126,
+            14,
+            320,
+            24);
+
+        int nextY = 50;
+        if (replaceMode) {
+            CreateSearchChild(dialogWindow, WC_STATICW, L"Replace with:", 0, -1, 16, 54, 105, 22);
+            CreateSearchChild(
+                dialogWindow,
+                WC_EDITW,
+                replaceText_.c_str(),
+                WS_TABSTOP | ES_AUTOHSCROLL | WS_BORDER,
+                kReplaceTextId,
+                126,
+                50,
+                320,
+                24);
+            nextY = 86;
+        }
+
+        HWND matchCase = CreateSearchChild(
+            dialogWindow,
+            WC_BUTTONW,
+            L"Match case",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            kMatchCaseId,
+            126,
+            nextY,
+            135,
+            22);
+        HWND wholeWord = CreateSearchChild(
+            dialogWindow,
+            WC_BUTTONW,
+            L"Match whole word only",
+            WS_TABSTOP | BS_AUTOCHECKBOX,
+            kWholeWordId,
+            270,
+            nextY,
+            176,
+            22);
+        ::SendMessageW(matchCase, BM_SETCHECK, searchMatchCase_ ? BST_CHECKED : BST_UNCHECKED, 0);
+        ::SendMessageW(wholeWord, BM_SETCHECK, searchWholeWord_ ? BST_CHECKED : BST_UNCHECKED, 0);
+
+        CreateSearchChild(dialogWindow, WC_STATICW, L"Occ: 0/0", 0, kOccurrenceLabelId, 16, nextY + 38, 128, 22);
+        CreateSearchChild(
+            dialogWindow,
+            WC_BUTTONW,
+            L"Find Previous",
+            WS_TABSTOP | BS_PUSHBUTTON,
+            kFindPreviousId,
+            154,
+            nextY + 34,
+            112,
+            30);
+        CreateSearchChild(
+            dialogWindow,
+            WC_BUTTONW,
+            L"Find Next",
+            WS_TABSTOP | BS_DEFPUSHBUTTON,
+            kFindNextId,
+            274,
+            nextY + 34,
+            88,
+            30);
+        CreateSearchChild(
+            dialogWindow,
+            WC_BUTTONW,
+            L"Close",
+            WS_TABSTOP | BS_PUSHBUTTON,
+            kCloseSearchId,
+            370,
+            nextY + 34,
+            76,
+            30);
+
+        if (replaceMode) {
+            CreateSearchChild(
+                dialogWindow,
+                WC_BUTTONW,
+                L"Replace",
+                WS_TABSTOP | BS_PUSHBUTTON,
+                kReplaceButtonId,
+                154,
+                nextY + 72,
+                88,
+                30);
+            CreateSearchChild(
+                dialogWindow,
+                WC_BUTTONW,
+                L"Replace All",
+                WS_TABSTOP | BS_PUSHBUTTON,
+                kReplaceAllButtonId,
+                250,
+                nextY + 72,
+                112,
+                30);
+        }
+
+        updatingSearchControls_ = false;
+        UpdateOccurrenceLabels();
+    }
+
+    void HandleSearchCommand(HWND dialogWindow, int controlId, int notificationCode, HWND) {
+        if (updatingSearchControls_) {
+            return;
+        }
+
+        switch (controlId) {
+        case kSearchTextId:
+        case kReplaceTextId:
+            if (notificationCode == EN_CHANGE) {
+                SyncSearchStateFromWindow(dialogWindow);
+                RefreshSearchMatches();
+            }
+            break;
+        case kMatchCaseId:
+        case kWholeWordId:
+            if (notificationCode == BN_CLICKED) {
+                SyncSearchStateFromWindow(dialogWindow);
+                RefreshSearchMatches();
+            }
+            break;
+        case kFindNextId:
+            SyncSearchStateFromWindow(dialogWindow);
+            SelectSearchMatch(true);
+            break;
+        case kFindPreviousId:
+            SyncSearchStateFromWindow(dialogWindow);
+            SelectSearchMatch(false);
+            break;
+        case kReplaceButtonId:
+            SyncSearchStateFromWindow(dialogWindow);
+            ReplaceCurrentMatch();
+            break;
+        case kReplaceAllButtonId:
+            SyncSearchStateFromWindow(dialogWindow);
+            ReplaceAllMatches();
+            break;
+        case kCloseSearchId:
+            ::DestroyWindow(dialogWindow);
+            break;
+        default:
+            break;
+        }
+    }
+
+    void SyncSearchStateFromWindow(HWND dialogWindow) {
+        searchText_ = GetControlText(::GetDlgItem(dialogWindow, kSearchTextId));
+        if (::GetDlgItem(dialogWindow, kReplaceTextId) != nullptr) {
+            replaceText_ = GetControlText(::GetDlgItem(dialogWindow, kReplaceTextId));
+        }
+        searchMatchCase_ = ::SendMessageW(::GetDlgItem(dialogWindow, kMatchCaseId), BM_GETCHECK, 0, 0) == BST_CHECKED;
+        searchWholeWord_ = ::SendMessageW(::GetDlgItem(dialogWindow, kWholeWordId), BM_GETCHECK, 0, 0) == BST_CHECKED;
+    }
+
+    std::wstring GetControlText(HWND control) const {
+        if (control == nullptr) {
+            return {};
+        }
+
+        const int length = ::GetWindowTextLengthW(control);
+        std::wstring text(static_cast<size_t>(length) + 1, L'\0');
+        if (length > 0) {
+            ::GetWindowTextW(control, text.data(), length + 1);
+        }
+        text.resize(static_cast<size_t>(length));
+        return text;
+    }
+
+    void PrefillSearchFromSelection() {
+        if (editor_ == nullptr || EditorSend(SCI_GETSELECTIONEMPTY) != 0) {
+            return;
+        }
+
+        const sptr_t start = EditorSend(SCI_GETSELECTIONSTART);
+        const sptr_t end = EditorSend(SCI_GETSELECTIONEND);
+        if (end <= start) {
+            return;
+        }
+
+        std::string selected(static_cast<size_t>(end - start) + 1, '\0');
+        Sci_TextRangeFull range = {};
+        range.chrg.cpMin = start;
+        range.chrg.cpMax = end;
+        range.lpstrText = selected.data();
+        EditorSend(SCI_GETTEXTRANGEFULL, 0, reinterpret_cast<sptr_t>(&range));
+        selected.resize(static_cast<size_t>(end - start));
+        if (selected.find_first_of("\r\n") != std::string::npos) {
+            return;
+        }
+
+        searchText_ = Utf8ToWide(selected);
+        UpdateSearchFields();
+    }
+
+    int SearchFlags() const {
+        int flags = SCFIND_NONE;
+        if (searchMatchCase_) {
+            flags |= SCFIND_MATCHCASE;
+        }
+        if (searchWholeWord_) {
+            flags |= SCFIND_WHOLEWORD;
+        }
+        return flags;
+    }
+
+    void ConfigureSearchIndicator() {
+        if (editor_ == nullptr || searchIndicatorConfigured_) {
+            return;
+        }
+
+        EditorSend(SCI_INDICSETSTYLE, kSearchIndicator, INDIC_ROUNDBOX);
+        EditorSend(SCI_INDICSETFORE, kSearchIndicator, kSearchHighlight);
+        EditorSend(SCI_INDICSETALPHA, kSearchIndicator, 80);
+        EditorSend(SCI_INDICSETOUTLINEALPHA, kSearchIndicator, 140);
+        searchIndicatorConfigured_ = true;
+    }
+
+    void ClearSearchHighlights() {
+        if (editor_ == nullptr) {
+            return;
+        }
+
+        EditorSend(SCI_SETINDICATORCURRENT, kSearchIndicator);
+        EditorSend(SCI_INDICATORCLEARRANGE, 0, EditorSend(SCI_GETLENGTH));
+    }
+
+    void RefreshSearchMatches() {
+        if (editor_ == nullptr) {
+            return;
+        }
+
+        ConfigureSearchIndicator();
+        ClearSearchHighlights();
+        searchMatches_.clear();
+        currentMatchIndex_ = -1;
+
+        const std::string searchUtf8 = WideToUtf8(searchText_);
+        if (!searchUtf8.empty()) {
+            const sptr_t documentLength = EditorSend(SCI_GETLENGTH);
+            sptr_t searchStart = 0;
+            while (searchStart < documentLength) {
+                Sci_TextToFindFull find = {};
+                find.chrg.cpMin = searchStart;
+                find.chrg.cpMax = documentLength;
+                find.lpstrText = searchUtf8.c_str();
+                const sptr_t found = EditorSend(SCI_FINDTEXTFULL, SearchFlags(), reinterpret_cast<sptr_t>(&find));
+                if (found < 0 || find.chrgText.cpMax <= find.chrgText.cpMin) {
+                    break;
+                }
+
+                searchMatches_.push_back({find.chrgText.cpMin, find.chrgText.cpMax});
+                EditorSend(SCI_SETINDICATORCURRENT, kSearchIndicator);
+                EditorSend(SCI_INDICATORFILLRANGE, find.chrgText.cpMin, find.chrgText.cpMax - find.chrgText.cpMin);
+                searchStart = find.chrgText.cpMax;
+            }
+
+            currentMatchIndex_ = MatchIndexForSelection();
+        }
+
+        UpdateOccurrenceLabels();
+    }
+
+    int MatchIndexForSelection() const {
+        if (editor_ == nullptr) {
+            return -1;
+        }
+
+        const sptr_t start = EditorSend(SCI_GETSELECTIONSTART);
+        const sptr_t end = EditorSend(SCI_GETSELECTIONEND);
+        for (size_t index = 0; index < searchMatches_.size(); ++index) {
+            if (searchMatches_[index].start == start && searchMatches_[index].end == end) {
+                return static_cast<int>(index);
+            }
+        }
+        return -1;
+    }
+
+    int NextMatchIndexFromPosition(sptr_t position) const {
+        if (searchMatches_.empty()) {
+            return -1;
+        }
+        for (size_t index = 0; index < searchMatches_.size(); ++index) {
+            if (searchMatches_[index].start >= position) {
+                return static_cast<int>(index);
+            }
+        }
+        return 0;
+    }
+
+    int PreviousMatchIndexFromPosition(sptr_t position) const {
+        if (searchMatches_.empty()) {
+            return -1;
+        }
+        for (size_t index = searchMatches_.size(); index > 0; --index) {
+            if (searchMatches_[index - 1].start < position) {
+                return static_cast<int>(index - 1);
+            }
+        }
+        return static_cast<int>(searchMatches_.size() - 1);
+    }
+
+    void SelectSearchMatch(bool forward) {
+        RefreshSearchMatches();
+        if (searchMatches_.empty()) {
+            return;
+        }
+
+        const sptr_t position = forward ? EditorSend(SCI_GETSELECTIONEND) : EditorSend(SCI_GETSELECTIONSTART);
+        const int selectionIndex = MatchIndexForSelection();
+        int nextIndex = -1;
+        if (forward) {
+            nextIndex = selectionIndex >= 0 ?
+                (selectionIndex + 1) % static_cast<int>(searchMatches_.size()) :
+                NextMatchIndexFromPosition(position);
+        } else {
+            nextIndex = selectionIndex >= 0 ?
+                (selectionIndex + static_cast<int>(searchMatches_.size()) - 1) % static_cast<int>(searchMatches_.size()) :
+                PreviousMatchIndexFromPosition(position);
+        }
+
+        SelectSearchMatchByIndex(nextIndex);
+    }
+
+    void SelectSearchMatchByIndex(int index) {
+        if (index < 0 || index >= static_cast<int>(searchMatches_.size())) {
+            currentMatchIndex_ = -1;
+            UpdateOccurrenceLabels();
+            return;
+        }
+
+        const MatchRange &match = searchMatches_[static_cast<size_t>(index)];
+        EditorSend(SCI_SETSEL, match.start, match.end);
+        EditorSend(SCI_SCROLLCARET);
+        currentMatchIndex_ = index;
+        UpdateOccurrenceLabels();
+        ::SetFocus(editor_);
+    }
+
+    void SelectSearchMatchFromPosition(sptr_t position) {
+        RefreshSearchMatches();
+        SelectSearchMatchByIndex(NextMatchIndexFromPosition(position));
+    }
+
+    void ReplaceCurrentMatch() {
+        RefreshSearchMatches();
+        const int matchIndex = MatchIndexForSelection();
+        if (matchIndex < 0) {
+            SelectSearchMatch(true);
+            return;
+        }
+
+        const MatchRange match = searchMatches_[static_cast<size_t>(matchIndex)];
+        const std::string replacement = WideToUtf8(replaceText_);
+        EditorSend(SCI_TARGETFROMSELECTION);
+        const sptr_t replacementLength = EditorSend(
+            SCI_REPLACETARGET,
+            static_cast<uptr_t>(replacement.size()),
+            reinterpret_cast<sptr_t>(replacement.c_str()));
+        SelectSearchMatchFromPosition(match.start + std::max<sptr_t>(replacementLength, 0));
+    }
+
+    void ReplaceAllMatches() {
+        const std::string searchUtf8 = WideToUtf8(searchText_);
+        if (editor_ == nullptr || searchUtf8.empty()) {
+            RefreshSearchMatches();
+            return;
+        }
+
+        const std::string replacement = WideToUtf8(replaceText_);
+        sptr_t searchStart = 0;
+        sptr_t finalPosition = EditorSend(SCI_GETCURRENTPOS);
+        suppressSearchRefresh_ = true;
+        EditorSend(SCI_BEGINUNDOACTION);
+        while (searchStart <= EditorSend(SCI_GETLENGTH)) {
+            Sci_TextToFindFull find = {};
+            find.chrg.cpMin = searchStart;
+            find.chrg.cpMax = EditorSend(SCI_GETLENGTH);
+            find.lpstrText = searchUtf8.c_str();
+            const sptr_t found = EditorSend(SCI_FINDTEXTFULL, SearchFlags(), reinterpret_cast<sptr_t>(&find));
+            if (found < 0 || find.chrgText.cpMax <= find.chrgText.cpMin) {
+                break;
+            }
+
+            EditorSend(SCI_SETTARGETRANGE, find.chrgText.cpMin, find.chrgText.cpMax);
+            const sptr_t replacementLength = EditorSend(
+                SCI_REPLACETARGET,
+                static_cast<uptr_t>(replacement.size()),
+                reinterpret_cast<sptr_t>(replacement.c_str()));
+            finalPosition = find.chrgText.cpMin + std::max<sptr_t>(replacementLength, 0);
+            searchStart = finalPosition;
+        }
+        EditorSend(SCI_ENDUNDOACTION);
+        suppressSearchRefresh_ = false;
+
+        EditorSend(SCI_SETSEL, finalPosition, finalPosition);
+        RefreshSearchMatches();
+        UpdateStatusBar();
+        ::SetFocus(editor_);
+    }
+
+    void UpdateSearchFields() {
+        updatingSearchControls_ = true;
+        if (findWindow_ != nullptr && ::IsWindow(findWindow_)) {
+            ::SetWindowTextW(::GetDlgItem(findWindow_, kSearchTextId), searchText_.c_str());
+        }
+        if (replaceWindow_ != nullptr && ::IsWindow(replaceWindow_)) {
+            ::SetWindowTextW(::GetDlgItem(replaceWindow_, kSearchTextId), searchText_.c_str());
+        }
+        updatingSearchControls_ = false;
+    }
+
+    void UpdateOccurrenceLabels() {
+        wchar_t buffer[64] = {};
+        const int total = static_cast<int>(searchMatches_.size());
+        const int current = currentMatchIndex_ >= 0 ? currentMatchIndex_ + 1 : 0;
+        swprintf_s(buffer, L"Occ: %d/%d", current, total);
+
+        if (findWindow_ != nullptr && ::IsWindow(findWindow_)) {
+            ::SetWindowTextW(::GetDlgItem(findWindow_, kOccurrenceLabelId), buffer);
+        }
+        if (replaceWindow_ != nullptr && ::IsWindow(replaceWindow_)) {
+            ::SetWindowTextW(::GetDlgItem(replaceWindow_, kOccurrenceLabelId), buffer);
+        }
+    }
+
+    void DestroySearchWindow(HWND window) {
+        if (window != nullptr && ::IsWindow(window)) {
+            ::DestroyWindow(window);
+        }
+    }
+
+    void OnSearchWindowDestroyed(HWND window) {
+        if (window == findWindow_) {
+            findWindow_ = nullptr;
+        }
+        if (window == replaceWindow_) {
+            replaceWindow_ = nullptr;
+            replaceText_.clear();
+        }
+        if (!switchingSearchWindow_ && findWindow_ == nullptr && replaceWindow_ == nullptr) {
+            searchText_.clear();
+            searchMatches_.clear();
+            currentMatchIndex_ = -1;
+            ClearSearchHighlights();
+        }
     }
 
     bool LoadDocument(const std::wstring &path, LoadedDocument *document, std::wstring *errorMessage) {
