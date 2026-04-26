@@ -8,9 +8,8 @@ It focuses on a small, practical feature set:
 - Line numbers and status bar
 - Word wrap toggle
 - Zooming
+- Search and replace
 - Light and dark theme modes
-- Basic file and edit commands with keyboard shortcuts
-
 
 ## Keyboard Shortcuts
 
@@ -19,6 +18,8 @@ It focuses on a small, practical feature set:
 - `Ctrl+S` - Save
 - `Ctrl+Shift+S` - Save As
 - `Ctrl+Z` - Undo
+- `Ctrl+F` - Find
+- `Ctrl+H` - Replace
 - `Ctrl++` - Zoom In
 - `Ctrl+-` - Zoom Out
 - `Ctrl+0` - Reset Zoom
