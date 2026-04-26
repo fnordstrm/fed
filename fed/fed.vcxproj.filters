@@ -13,15 +13,51 @@
       <UniqueIdentifier>{2C8D273A-5308-4905-A785-D582FB82692A}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav</Extensions>
     </Filter>
+    <Filter Include="Source Files\Scintilla">
+      <UniqueIdentifier>{10B17D54-65CC-4D63-90B1-D98F1AD85A6A}</UniqueIdentifier>
+    </Filter>
+    <Filter Include="Header Files\Scintilla">
+      <UniqueIdentifier>{B98059D8-F1D5-43D1-B582-C900D2233468}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="fed.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\scintilla\src\*.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\HanjaDic.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\ListBox.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\PlatWin.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\ScintillaWin.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\SurfaceD2D.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
+    <ClCompile Include="..\scintilla\win32\SurfaceGDI.cxx">
+      <Filter>Source Files\Scintilla</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="resource.h">
       <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\scintilla\include\*.h">
+      <Filter>Header Files\Scintilla</Filter>
+    </ClInclude>
+    <ClInclude Include="..\scintilla\src\*.h">
+      <Filter>Header Files\Scintilla</Filter>
+    </ClInclude>
+    <ClInclude Include="..\scintilla\win32\*.h">
+      <Filter>Header Files\Scintilla</Filter>
     </ClInclude>
   </ItemGroup>
   <ItemGroup>

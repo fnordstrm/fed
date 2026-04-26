@@ -1,9 +1,9 @@
 #include <windows.h>
 #include <commctrl.h>
-#include <commdlg.h>
 #include <dwmapi.h>
 #include <ole2.h>
 #include <shellapi.h>
+#include <shobjidl.h>
 #include <uxtheme.h>
 
 #include <algorithm>
@@ -87,48 +87,20 @@ EditorPalette PaletteForDarkMode(bool darkModeEnabled) {
     };
 }
 
-class DarkModeSupport {
-public:
-    void Initialize(bool) const {}
-
-    void ApplyAppMode(bool) const {}
-
-    void ApplyWindowTheme(HWND window, bool darkModeEnabled) const {
-        if (window == nullptr) {
-            return;
-        }
-
-        const BOOL useDarkMode = darkModeEnabled ? TRUE : FALSE;
-        if (FAILED(::DwmSetWindowAttribute(
-                window,
-                DWMWA_USE_IMMERSIVE_DARK_MODE,
-                &useDarkMode,
-                sizeof(useDarkMode)))) {
-            constexpr DWORD legacyDarkModeAttribute = 19;
-            ::DwmSetWindowAttribute(window, legacyDarkModeAttribute, &useDarkMode, sizeof(useDarkMode));
-        }
-    }
-};
-
-COLORREF RgbFromColorRef(COLORREF color) {
-    return RGB(GetRValue(color), GetGValue(color), GetBValue(color));
-}
-
-std::wstring Utf8ToWide(std::string_view text) {
-    if (text.empty()) {
-        return {};
+void ApplyImmersiveDarkMode(HWND window, bool darkModeEnabled) {
+    if (window == nullptr) {
+        return;
     }
 
-    const int required = ::MultiByteToWideChar(
-        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
-    if (required <= 0) {
-        return {};
+    const BOOL useDarkMode = darkModeEnabled ? TRUE : FALSE;
+    if (FAILED(::DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            &useDarkMode,
+            sizeof(useDarkMode)))) {
+        constexpr DWORD legacyDarkModeAttribute = 19;
+        ::DwmSetWindowAttribute(window, legacyDarkModeAttribute, &useDarkMode, sizeof(useDarkMode));
     }
-
-    std::wstring wide(required, L'\0');
-    ::MultiByteToWideChar(
-        CP_UTF8, 0, text.data(), static_cast<int>(text.size()), wide.data(), required);
-    return wide;
 }
 
 std::string WideToUtf8(std::wstring_view text) {
@@ -165,7 +137,7 @@ std::wstring BytesToWide(UINT codePage, DWORD flags, std::string_view bytes) {
     return wide;
 }
 
-std::string SystemMessage(DWORD error) {
+std::wstring SystemMessageWide(DWORD error) {
     wchar_t *buffer = nullptr;
     const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
         FORMAT_MESSAGE_IGNORE_INSERTS;
@@ -182,9 +154,46 @@ std::string SystemMessage(DWORD error) {
         ::LocalFree(buffer);
     }
     if (message.empty()) {
-        return "Unknown error";
+        return L"Unknown error";
     }
-    return WideToUtf8(message);
+    return message;
+}
+
+void SetSystemErrorMessage(DWORD error, std::wstring *errorMessage) {
+    *errorMessage = SystemMessageWide(error);
+}
+
+class UniqueHandle {
+public:
+    explicit UniqueHandle(HANDLE handle = INVALID_HANDLE_VALUE) : handle_(handle) {}
+
+    UniqueHandle(const UniqueHandle &) = delete;
+    UniqueHandle &operator=(const UniqueHandle &) = delete;
+
+    ~UniqueHandle() {
+        if (IsValid()) {
+            ::CloseHandle(handle_);
+        }
+    }
+
+    bool IsValid() const {
+        return handle_ != INVALID_HANDLE_VALUE && handle_ != nullptr;
+    }
+
+    HANDLE Get() const {
+        return handle_;
+    }
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+};
+
+std::wstring DirectoryFromPath(const std::wstring &path) {
+    const size_t separator = path.find_last_of(L"\\/");
+    if (separator == std::wstring::npos) {
+        return {};
+    }
+    return path.substr(0, separator);
 }
 
 std::wstring FileNameFromPath(const std::wstring &path) {
@@ -247,30 +256,27 @@ bool TryGetFileSize(const std::wstring &path, ULONGLONG *sizeBytes) {
 }
 
 bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring *errorMessage) {
-    HANDLE file = ::CreateFileW(
-        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+    UniqueHandle file(::CreateFileW(
+        path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.IsValid()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
     LARGE_INTEGER fileSize = {};
-    if (!::GetFileSizeEx(file, &fileSize)) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
-        ::CloseHandle(file);
+    if (!::GetFileSizeEx(file.Get(), &fileSize)) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
     if (fileSize.QuadPart < 0) {
         *errorMessage = L"File is too large to open.";
-        ::CloseHandle(file);
         return false;
     }
 
     const ULONGLONG byteCount = static_cast<ULONGLONG>(fileSize.QuadPart);
     if (byteCount > static_cast<ULONGLONG>((std::numeric_limits<size_t>::max)())) {
         *errorMessage = L"File is too large to open.";
-        ::CloseHandle(file);
         return false;
     }
 
@@ -280,15 +286,14 @@ bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring 
     while (ok && totalRead < contents->size()) {
         const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(contents->size() - totalRead, 1u << 20));
         DWORD read = 0;
-        ok = ::ReadFile(file, contents->data() + totalRead, chunkSize, &read, nullptr);
+        ok = ::ReadFile(file.Get(), contents->data() + totalRead, chunkSize, &read, nullptr);
         totalRead += read;
         if (read == 0) {
             break;
         }
     }
-    ::CloseHandle(file);
     if (!ok) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
     contents->resize(totalRead);
@@ -296,10 +301,10 @@ bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring 
 }
 
 bool WriteAllBytes(const std::wstring &path, const std::string &contents, std::wstring *errorMessage) {
-    HANDLE file = ::CreateFileW(
-        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
+    UniqueHandle file(::CreateFileW(
+        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
+    if (!file.IsValid()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
@@ -308,19 +313,21 @@ bool WriteAllBytes(const std::wstring &path, const std::string &contents, std::w
     while (ok && totalWritten < contents.size()) {
         const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(contents.size() - totalWritten, 1u << 20));
         DWORD written = 0;
-        ok = ::WriteFile(file, contents.data() + totalWritten, chunkSize, &written, nullptr);
+        ok = ::WriteFile(file.Get(), contents.data() + totalWritten, chunkSize, &written, nullptr);
         totalWritten += written;
         if (written == 0) {
             break;
         }
     }
     if (!ok || totalWritten != contents.size()) {
-        *errorMessage = Utf8ToWide(SystemMessage(::GetLastError()));
-        ::CloseHandle(file);
+        if (!ok) {
+            SetSystemErrorMessage(::GetLastError(), errorMessage);
+        } else {
+            *errorMessage = L"Unable to write the complete file.";
+        }
         return false;
     }
 
-    ::CloseHandle(file);
     return true;
 }
 
@@ -476,8 +483,6 @@ public:
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
         frameBrush_ = ::CreateSolidBrush(palette.back);
         statusBrush_ = ::CreateSolidBrush(CurrentStatusBarBackColor());
-        darkModeSupport_.Initialize(darkModeEnabled_);
-
         if (!::Scintilla_RegisterClasses(instance_)) {
             ::MessageBoxW(nullptr, L"Failed to register Scintilla window classes.", kAppName, MB_ICONERROR | MB_OK);
             DestroyUiResources();
@@ -524,8 +529,6 @@ private:
     HFONT statusFont_ = nullptr;
     std::wstring currentPath_;
     std::wstring editorFontFace_;
-    DarkModeSupport darkModeSupport_;
-    int preferredEolMode_ = SC_EOL_CRLF;
     bool writeUtf8Bom_ = false;
     StyleMode styleMode_ = StyleMode::System;
     bool darkModeEnabled_ = false;
@@ -972,27 +975,27 @@ private:
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
         const std::string fontName = WideToUtf8(editorFontFace_);
 
-        EditorSend(SCI_STYLESETFORE, STYLE_DEFAULT, RgbFromColorRef(palette.fore));
-        EditorSend(SCI_STYLESETBACK, STYLE_DEFAULT, RgbFromColorRef(palette.back));
+        EditorSend(SCI_STYLESETFORE, STYLE_DEFAULT, palette.fore);
+        EditorSend(SCI_STYLESETBACK, STYLE_DEFAULT, palette.back);
         EditorSend(SCI_STYLESETSIZE, STYLE_DEFAULT, kDefaultEditorFontSize);
         EditorSend(SCI_STYLESETFONT, STYLE_DEFAULT, reinterpret_cast<sptr_t>(fontName.c_str()));
         EditorSend(SCI_STYLECLEARALL);
 
-        EditorSend(SCI_STYLESETFORE, STYLE_LINENUMBER, RgbFromColorRef(palette.gutterFore));
-        EditorSend(SCI_STYLESETBACK, STYLE_LINENUMBER, RgbFromColorRef(palette.gutterBack));
-        EditorSend(SCI_SETMARGINBACKN, 1, RgbFromColorRef(palette.back));
+        EditorSend(SCI_STYLESETFORE, STYLE_LINENUMBER, palette.gutterFore);
+        EditorSend(SCI_STYLESETBACK, STYLE_LINENUMBER, palette.gutterBack);
+        EditorSend(SCI_SETMARGINBACKN, 1, palette.back);
 
-        EditorSend(SCI_SETSELFORE, 1, RgbFromColorRef(palette.fore));
-        EditorSend(SCI_SETSELBACK, 1, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETCARETFORE, RgbFromColorRef(palette.caretFore));
+        EditorSend(SCI_SETSELFORE, 1, palette.fore);
+        EditorSend(SCI_SETSELBACK, 1, palette.selectionBack);
+        EditorSend(SCI_SETCARETFORE, palette.caretFore);
         EditorSend(SCI_SETCARETLINEVISIBLE, 1);
-        EditorSend(SCI_SETCARETLINEBACK, RgbFromColorRef(palette.currentLineBack));
+        EditorSend(SCI_SETCARETLINEBACK, palette.currentLineBack);
         EditorSend(SCI_SETCARETLINEBACKALPHA, SC_ALPHA_NOALPHA);
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST, RgbFromColorRef(palette.back));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_BACK, RgbFromColorRef(palette.back));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED_BACK, RgbFromColorRef(palette.selectionBack));
-        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET_LINE_BACK, RgbFromColorRef(palette.currentLineBack));
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST, palette.back);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_BACK, palette.back);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED, palette.selectionBack);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_LIST_SELECTED_BACK, palette.selectionBack);
+        EditorSend(SCI_SETELEMENTCOLOUR, SC_ELEMENT_CARET_LINE_BACK, palette.currentLineBack);
         ::InvalidateRect(editor_, nullptr, TRUE);
     }
 
@@ -1013,9 +1016,8 @@ private:
         }
 
         applyingDarkMode_ = true;
-        darkModeSupport_.ApplyAppMode(darkModeEnabled_);
-        darkModeSupport_.ApplyWindowTheme(window_, darkModeEnabled_);
-        darkModeSupport_.ApplyWindowTheme(editor_, darkModeEnabled_);
+        ApplyImmersiveDarkMode(window_, darkModeEnabled_);
+        ApplyImmersiveDarkMode(editor_, darkModeEnabled_);
 
         const wchar_t *themeClass = darkModeEnabled_ ? kDarkThemeClassName : kLightThemeClassName;
         if (window_ != nullptr) {
@@ -1105,11 +1107,10 @@ private:
 
     void ResetToNewDocument() {
         currentPath_.clear();
-        preferredEolMode_ = SC_EOL_CRLF;
         writeUtf8Bom_ = false;
 
         EditorSend(SCI_SETTEXT, 0, reinterpret_cast<sptr_t>(""));
-        EditorSend(SCI_SETEOLMODE, preferredEolMode_);
+        EditorSend(SCI_SETEOLMODE, SC_EOL_CRLF);
         EditorSend(SCI_EMPTYUNDOBUFFER);
         EditorSend(SCI_SETSAVEPOINT);
         EditorSend(SCI_GOTOPOS, 0);
@@ -1131,11 +1132,10 @@ private:
         }
 
         EditorSend(SCI_SETTEXT, 0, reinterpret_cast<sptr_t>(document.utf8Text.c_str()));
-        preferredEolMode_ = document.eolMode;
         writeUtf8Bom_ = document.hadUtf8Bom;
         currentPath_ = path;
 
-        EditorSend(SCI_SETEOLMODE, preferredEolMode_);
+        EditorSend(SCI_SETEOLMODE, document.eolMode);
         EditorSend(SCI_EMPTYUNDOBUFFER);
         EditorSend(SCI_SETSAVEPOINT);
         EditorSend(SCI_GOTOPOS, 0);
@@ -1214,29 +1214,60 @@ private:
     }
 
     std::wstring PromptForPath(bool open) {
-        wchar_t buffer[MAX_PATH] = {};
+        IFileDialog *dialog = nullptr;
+        const CLSID dialogClass = open ? CLSID_FileOpenDialog : CLSID_FileSaveDialog;
+        HRESULT result = ::CoCreateInstance(
+            dialogClass,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&dialog));
+        if (FAILED(result)) {
+            return {};
+        }
+
+        constexpr COMDLG_FILTERSPEC filters[] = {
+            {L"Text Files (*.txt)", L"*.txt"},
+            {L"All Files (*.*)", L"*.*"},
+        };
+        dialog->SetFileTypes(ARRAYSIZE(filters), filters);
+        dialog->SetFileTypeIndex(1);
+        dialog->SetDefaultExtension(L"txt");
+
+        DWORD options = 0;
+        if (SUCCEEDED(dialog->GetOptions(&options))) {
+            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+            options |= open ? FOS_FILEMUSTEXIST : FOS_OVERWRITEPROMPT;
+            dialog->SetOptions(options);
+        }
+
         if (!currentPath_.empty()) {
-            wcsncpy_s(buffer, currentPath_.c_str(), _TRUNCATE);
+            const std::wstring directory = DirectoryFromPath(currentPath_);
+            if (!directory.empty()) {
+                IShellItem *folder = nullptr;
+                if (SUCCEEDED(::SHCreateItemFromParsingName(directory.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
+                    dialog->SetFolder(folder);
+                    folder->Release();
+                }
+            }
+            dialog->SetFileName(FileNameFromPath(currentPath_).c_str());
         }
 
-        constexpr wchar_t filters[] =
-            L"Text Files (*.txt)\0*.txt\0"
-            L"All Files (*.*)\0*.*\0\0";
-
-        OPENFILENAMEW dialog = {};
-        dialog.lStructSize = sizeof(dialog);
-        dialog.hwndOwner = window_;
-        dialog.lpstrFilter = filters;
-        dialog.lpstrFile = buffer;
-        dialog.nMaxFile = MAX_PATH;
-        dialog.Flags = OFN_EXPLORER | OFN_HIDEREADONLY | OFN_PATHMUSTEXIST;
-        dialog.lpstrDefExt = L"txt";
-        if (open) {
-            dialog.Flags |= OFN_FILEMUSTEXIST;
-            return ::GetOpenFileNameW(&dialog) ? std::wstring(buffer) : std::wstring();
+        std::wstring path;
+        result = dialog->Show(window_);
+        if (SUCCEEDED(result)) {
+            IShellItem *item = nullptr;
+            if (SUCCEEDED(dialog->GetResult(&item))) {
+                PWSTR filePath = nullptr;
+                if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &filePath))) {
+                    path = filePath;
+                    ::CoTaskMemFree(filePath);
+                }
+                item->Release();
+            }
         }
-        dialog.Flags |= OFN_OVERWRITEPROMPT;
-        return ::GetSaveFileNameW(&dialog) ? std::wstring(buffer) : std::wstring();
+
+        dialog->Release();
+        return path;
     }
 
     bool LoadDocument(const std::wstring &path, LoadedDocument *document, std::wstring *errorMessage) {
