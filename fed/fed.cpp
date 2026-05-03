@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
 #include <dwmapi.h>
 #include <ole2.h>
 #include <shellapi.h>
@@ -27,6 +28,10 @@ constexpr int kDefaultEditorFontSize = 11;
 constexpr int kMinLineNumberDigits = 3;
 constexpr int kStatusHeight = 24;
 constexpr int kLineNumberSpacerWidth = 6;
+constexpr int kLineNumberTextPadding = 8;
+constexpr int kStatusLeftPadding = 8;
+constexpr int kStatusFieldGap = 8;
+constexpr int kStatusFieldPadding = 8;
 constexpr int kSearchIndicator = 8;
 constexpr int kSearchDialogWidth = 475;
 constexpr int kFindDialogHeight = 190;
@@ -244,6 +249,25 @@ std::wstring FileNameFromPath(const std::wstring &path) {
     return path.substr(separator + 1);
 }
 
+std::wstring InitialPathFromCommandLine(PWSTR commandLine) {
+    if (commandLine == nullptr || commandLine[0] == L'\0') {
+        return {};
+    }
+
+    int argc = 0;
+    wchar_t **argv = ::CommandLineToArgvW(commandLine, &argc);
+    if (argv == nullptr) {
+        return commandLine;
+    }
+
+    std::wstring path;
+    if (argc > 0 && argv[0] != nullptr) {
+        path = argv[0];
+    }
+    ::LocalFree(argv);
+    return path;
+}
+
 bool ReadRegistryDword(HKEY root, const wchar_t *subKey, const wchar_t *valueName, DWORD *value) {
     DWORD type = 0;
     DWORD size = sizeof(*value);
@@ -293,6 +317,33 @@ bool TryGetFileSize(const std::wstring &path, ULONGLONG *sizeBytes) {
     size.LowPart = attributes.nFileSizeLow;
     *sizeBytes = size.QuadPart;
     return true;
+}
+
+std::wstring AppDataDirectory() {
+    DWORD required = ::GetEnvironmentVariableW(L"APPDATA", nullptr, 0);
+    if (required == 0) {
+        return {};
+    }
+
+    std::wstring path(required, L'\0');
+    const DWORD copied = ::GetEnvironmentVariableW(L"APPDATA", path.data(), required);
+    if (copied == 0 || copied >= required) {
+        return {};
+    }
+    path.resize(copied);
+    return path + L"\\fed";
+}
+
+std::wstring SettingsPath() {
+    const std::wstring directory = AppDataDirectory();
+    if (directory.empty()) {
+        return {};
+    }
+    return directory + L"\\settings.ini";
+}
+
+bool TextValueIsTrue(std::string_view value) {
+    return value == "1" || value == "true" || value == "True" || value == "yes" || value == "Yes";
 }
 
 bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring *errorMessage) {
@@ -496,7 +547,7 @@ LRESULT CALLBACK StatusBarSubclassProc(
     switch (message) {
     case WM_LBUTTONDOWN:
         ::ReleaseCapture();
-        ::SendMessageW(::GetParent(window), WM_NCLBUTTONDOWN, HTCAPTION, 0);
+        ::SendMessageW(::GetAncestor(window, GA_ROOT), WM_NCLBUTTONDOWN, HTCAPTION, 0);
         return 0;
     case WM_NCDESTROY:
         ::RemoveWindowSubclass(window, StatusBarSubclassProc, 0);
@@ -523,7 +574,7 @@ class FedWindow {
 public:
     explicit FedWindow(HINSTANCE instance) : instance_(instance) {}
 
-    int Run(int showCommand) {
+    int Run(int showCommand, const std::wstring &initialPath) {
         INITCOMMONCONTROLSEX controls = {};
         controls.dwSize = sizeof(controls);
         controls.dwICC = ICC_STANDARD_CLASSES | ICC_BAR_CLASSES;
@@ -531,6 +582,7 @@ public:
         const HRESULT oleResult = ::OleInitialize(nullptr);
         const bool oleInitialized = SUCCEEDED(oleResult);
 
+        LoadSettings();
         editorFontFace_ = SelectEditorFont();
         statusFont_ = CreateUiFont(editorFontFace_, 11, FW_NORMAL);
         searchFont_ = CreateMessageFont();
@@ -558,6 +610,9 @@ public:
         }
 
         accelerator_ = ::LoadAcceleratorsW(instance_, MAKEINTRESOURCEW(IDR_ACCELERATORS));
+        if (!initialPath.empty()) {
+            OpenDocument(initialPath);
+        }
 
         MSG message = {};
         while (::GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -582,6 +637,10 @@ private:
     HWND window_ = nullptr;
     HWND editor_ = nullptr;
     HWND statusBar_ = nullptr;
+    HWND statusPosition_ = nullptr;
+    HWND statusDocumentSize_ = nullptr;
+    HWND statusTextFormat_ = nullptr;
+    HWND statusFontInfo_ = nullptr;
     HACCEL accelerator_ = nullptr;
     HBRUSH statusBrush_ = nullptr;
     HBRUSH frameBrush_ = nullptr;
@@ -609,6 +668,10 @@ private:
     bool applyingDarkMode_ = false;
     bool showLineNumbers_ = true;
     bool showStatusBar_ = true;
+    bool showStatusPosition_ = true;
+    bool showStatusDocumentSize_ = true;
+    bool showStatusTextFormat_ = true;
+    bool showStatusFont_ = true;
     bool wordWrapEnabled_ = false;
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
@@ -776,11 +839,11 @@ private:
             OnInitMenuPopup(reinterpret_cast<HMENU>(wParam));
             return 0;
         case WM_CTLCOLORSTATIC:
-            if (reinterpret_cast<HWND>(lParam) == statusBar_) {
+            if (IsStatusWindow(reinterpret_cast<HWND>(lParam))) {
                 HDC dc = reinterpret_cast<HDC>(wParam);
                 ::SetTextColor(dc, kChromeText);
                 ::SetBkColor(dc, CurrentStatusBarBackColor());
-                ::SetBkMode(dc, OPAQUE);
+                ::SetBkMode(dc, TRANSPARENT);
                 return reinterpret_cast<LRESULT>(statusBrush_);
             }
             break;
@@ -790,6 +853,7 @@ private:
             return 0;
         case WM_CLOSE:
             if (ConfirmDiscardChanges()) {
+                SaveSettings();
                 ::DestroyWindow(window_);
             }
             return 0;
@@ -897,6 +961,10 @@ private:
         }
         ::SendMessageW(statusBar_, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont_), TRUE);
         ::SetWindowSubclass(statusBar_, StatusBarSubclassProc, 0, 0);
+        statusPosition_ = CreateStatusField(window_);
+        statusDocumentSize_ = CreateStatusField(window_);
+        statusTextFormat_ = CreateStatusField(window_);
+        statusFontInfo_ = CreateStatusField(window_);
 
         ApplyDarkMode();
         ConfigureEditor();
@@ -909,6 +977,108 @@ private:
     void RestoreEditorFocus() {
         if (editor_ != nullptr && ::GetFocus() != editor_) {
             ::SetFocus(editor_);
+        }
+    }
+
+    HWND CreateStatusField(HWND parent) {
+        HWND field = ::CreateWindowExW(
+            0,
+            WC_STATICW,
+            L"",
+            WS_CHILD | SS_LEFT | SS_CENTERIMAGE,
+            0,
+            0,
+            100,
+            kStatusHeight,
+            parent,
+            nullptr,
+            instance_,
+            nullptr);
+        if (field != nullptr) {
+            ::SendMessageW(field, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont_), TRUE);
+            ::SetWindowSubclass(field, StatusBarSubclassProc, 0, 0);
+        }
+        return field;
+    }
+
+    bool IsStatusWindow(HWND window) const {
+        return window == statusBar_ ||
+            window == statusPosition_ ||
+            window == statusDocumentSize_ ||
+            window == statusTextFormat_ ||
+            window == statusFontInfo_;
+    }
+
+    int MeasureStatusText(std::wstring_view text) const {
+        HDC dc = ::GetDC(statusBar_);
+        if (dc == nullptr) {
+            return 0;
+        }
+
+        HGDIOBJ oldFont = nullptr;
+        if (statusFont_ != nullptr) {
+            oldFont = ::SelectObject(dc, statusFont_);
+        }
+
+        SIZE size = {};
+        ::GetTextExtentPoint32W(dc, text.data(), static_cast<int>(text.size()), &size);
+        if (oldFont != nullptr) {
+            ::SelectObject(dc, oldFont);
+        }
+        ::ReleaseDC(statusBar_, dc);
+        return size.cx + kStatusFieldPadding;
+    }
+
+    void LayoutStatusField(HWND field, bool visible, int top, int *left, int width) {
+        if (field == nullptr || left == nullptr) {
+            return;
+        }
+        if (!showStatusBar_ || !visible) {
+            ::ShowWindow(field, SW_HIDE);
+            return;
+        }
+
+        ::MoveWindow(field, *left, top, width, kStatusHeight, TRUE);
+        ::SetWindowPos(field, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        ::ShowWindow(field, SW_SHOW);
+        ::RedrawWindow(field, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        *left += width + kStatusFieldGap;
+    }
+
+    void LayoutStatusBarFields() {
+        if (statusBar_ == nullptr) {
+            return;
+        }
+
+        int left = kStatusLeftPadding;
+        RECT statusRect = {};
+        ::GetWindowRect(statusBar_, &statusRect);
+        ::MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT *>(&statusRect), 2);
+
+        LayoutStatusField(statusPosition_, showStatusPosition_, statusRect.top, &left, MeasureStatusText(L"99999 : 99999"));
+        LayoutStatusField(
+            statusDocumentSize_,
+            showStatusDocumentSize_,
+            statusRect.top,
+            &left,
+            MeasureStatusText(L"99,999,999 bytes, 99,999 lines"));
+        LayoutStatusField(
+            statusTextFormat_,
+            showStatusTextFormat_,
+            statusRect.top,
+            &left,
+            MeasureStatusText(L"UTF-8 BOM, Macintosh (CR)"));
+        LayoutStatusField(statusFontInfo_, showStatusFont_, statusRect.top, &left, MeasureStatusText(editorFontFace_ + L" 99"));
+        ::RedrawWindow(statusBar_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+    }
+
+    void SetStatusFieldText(HWND field, bool visible, const wchar_t *text) {
+        if (field == nullptr) {
+            return;
+        }
+        ::SetWindowTextW(field, visible ? text : L"");
+        if (visible) {
+            ::RedrawWindow(field, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
         }
     }
 
@@ -932,6 +1102,9 @@ private:
             break;
         case ID_FILE_SAVE_AS:
             SaveDocument(true);
+            break;
+        case ID_FILE_PRINT:
+            PrintDocument();
             break;
         case ID_FILE_EXIT:
             ::SendMessageW(window_, WM_CLOSE, 0, 0);
@@ -983,6 +1156,30 @@ private:
             showStatusBar_ = !showStatusBar_;
             ::ShowWindow(statusBar_, showStatusBar_ ? SW_SHOW : SW_HIDE);
             LayoutChildren();
+            UpdateMenuChecks();
+            break;
+        case ID_VIEW_STATUS_POSITION:
+            showStatusPosition_ = !showStatusPosition_;
+            LayoutStatusBarFields();
+            UpdateStatusBar();
+            UpdateMenuChecks();
+            break;
+        case ID_VIEW_STATUS_DOCUMENT_SIZE:
+            showStatusDocumentSize_ = !showStatusDocumentSize_;
+            LayoutStatusBarFields();
+            UpdateStatusBar();
+            UpdateMenuChecks();
+            break;
+        case ID_VIEW_STATUS_TEXT_FORMAT:
+            showStatusTextFormat_ = !showStatusTextFormat_;
+            LayoutStatusBarFields();
+            UpdateStatusBar();
+            UpdateMenuChecks();
+            break;
+        case ID_VIEW_STATUS_FONT:
+            showStatusFont_ = !showStatusFont_;
+            LayoutStatusBarFields();
+            UpdateStatusBar();
             UpdateMenuChecks();
             break;
         case ID_VIEW_WORD_WRAP:
@@ -1133,6 +1330,8 @@ private:
         EditorSend(SCI_SETMARGINSENSITIVEN, 1, 0);
         EditorSend(SCI_SETSCROLLWIDTHTRACKING, 1);
         EditorSend(SCI_SETMODEVENTMASK, SC_MOD_INSERTTEXT | SC_MOD_DELETETEXT);
+        EditorSend(SCI_ASSIGNCMDKEY, SCK_UP + (SCMOD_ALT << 16), SCI_MOVESELECTEDLINESUP);
+        EditorSend(SCI_ASSIGNCMDKEY, SCK_DOWN + (SCMOD_ALT << 16), SCI_MOVESELECTEDLINESDOWN);
         ConfigureSearchIndicator();
         ApplyEditorAppearance();
         ApplyWordWrap();
@@ -1351,8 +1550,11 @@ private:
         } else {
             ::ShowWindow(statusBar_, SW_HIDE);
         }
-
         ::MoveWindow(editor_, 0, 0, client.right, editorBottom, TRUE);
+        if (showStatusBar_) {
+            ::SetWindowPos(statusBar_, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        LayoutStatusBarFields();
         UpdateStatusBar();
     }
 
@@ -1489,6 +1691,7 @@ private:
 
         constexpr COMDLG_FILTERSPEC filters[] = {
             {L"Text Files (*.txt)", L"*.txt"},
+            {L"Common Files (*.txt;*.srt;*.ini;*.bat)", L"*.txt;*.srt;*.ini;*.bat"},
             {L"All Files (*.*)", L"*.*"},
         };
         dialog->SetFileTypes(ARRAYSIZE(filters), filters);
@@ -1530,6 +1733,214 @@ private:
 
         dialog->Release();
         return path;
+    }
+
+    static const char *StyleModeName(StyleMode styleMode) {
+        switch (styleMode) {
+        case StyleMode::Light:
+            return "Light";
+        case StyleMode::Dark:
+            return "Dark";
+        case StyleMode::System:
+        default:
+            return "System";
+        }
+    }
+
+    static StyleMode StyleModeFromName(std::string_view value, StyleMode fallback) {
+        if (value == "Light") {
+            return StyleMode::Light;
+        }
+        if (value == "Dark") {
+            return StyleMode::Dark;
+        }
+        if (value == "System") {
+            return StyleMode::System;
+        }
+        return fallback;
+    }
+
+    void LoadSettings() {
+        const std::wstring path = SettingsPath();
+        if (path.empty()) {
+            return;
+        }
+
+        std::string contents;
+        std::wstring errorMessage;
+        if (!ReadAllBytes(path, &contents, &errorMessage)) {
+            return;
+        }
+
+        size_t lineStart = 0;
+        while (lineStart <= contents.size()) {
+            const size_t lineEnd = contents.find('\n', lineStart);
+            std::string line = contents.substr(
+                lineStart,
+                lineEnd == std::string::npos ? std::string::npos : lineEnd - lineStart);
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
+
+            const size_t separator = line.find('=');
+            if (separator != std::string::npos) {
+                const std::string key = line.substr(0, separator);
+                const std::string value = line.substr(separator + 1);
+                if (key == "LineNumbers") {
+                    showLineNumbers_ = TextValueIsTrue(value);
+                } else if (key == "StatusBar") {
+                    showStatusBar_ = TextValueIsTrue(value);
+                } else if (key == "StatusPosition") {
+                    showStatusPosition_ = TextValueIsTrue(value);
+                } else if (key == "StatusDocumentSize") {
+                    showStatusDocumentSize_ = TextValueIsTrue(value);
+                } else if (key == "StatusTextFormat") {
+                    showStatusTextFormat_ = TextValueIsTrue(value);
+                } else if (key == "StatusFont") {
+                    showStatusFont_ = TextValueIsTrue(value);
+                } else if (key == "WordWrap") {
+                    wordWrapEnabled_ = TextValueIsTrue(value);
+                } else if (key == "Style") {
+                    styleMode_ = StyleModeFromName(value, styleMode_);
+                } else if (key == "MatchCase") {
+                    searchMatchCase_ = TextValueIsTrue(value);
+                } else if (key == "MatchWholeWord") {
+                    searchWholeWord_ = TextValueIsTrue(value);
+                }
+            }
+
+            if (lineEnd == std::string::npos) {
+                break;
+            }
+            lineStart = lineEnd + 1;
+        }
+    }
+
+    void SaveSettings() {
+        const std::wstring path = SettingsPath();
+        const std::wstring directory = DirectoryFromPath(path);
+        if (path.empty() || directory.empty()) {
+            return;
+        }
+
+        ::CreateDirectoryW(directory.c_str(), nullptr);
+
+        std::string contents;
+        contents += "LineNumbers=";
+        contents += showLineNumbers_ ? "1\n" : "0\n";
+        contents += "StatusBar=";
+        contents += showStatusBar_ ? "1\n" : "0\n";
+        contents += "StatusPosition=";
+        contents += showStatusPosition_ ? "1\n" : "0\n";
+        contents += "StatusDocumentSize=";
+        contents += showStatusDocumentSize_ ? "1\n" : "0\n";
+        contents += "StatusTextFormat=";
+        contents += showStatusTextFormat_ ? "1\n" : "0\n";
+        contents += "StatusFont=";
+        contents += showStatusFont_ ? "1\n" : "0\n";
+        contents += "WordWrap=";
+        contents += wordWrapEnabled_ ? "1\n" : "0\n";
+        contents += "Style=";
+        contents += StyleModeName(styleMode_);
+        contents += "\n";
+        contents += "MatchCase=";
+        contents += searchMatchCase_ ? "1\n" : "0\n";
+        contents += "MatchWholeWord=";
+        contents += searchWholeWord_ ? "1\n" : "0\n";
+
+        std::wstring errorMessage;
+        WriteAllBytes(path, contents, &errorMessage);
+    }
+
+    void PrintDocument() {
+        if (editor_ == nullptr) {
+            return;
+        }
+
+        PRINTDLGW printDialog = {};
+        printDialog.lStructSize = sizeof(printDialog);
+        printDialog.hwndOwner = window_;
+        printDialog.Flags = PD_RETURNDC | PD_NOSELECTION | PD_NOPAGENUMS | PD_USEDEVMODECOPIESANDCOLLATE;
+        if (!::PrintDlgW(&printDialog) || printDialog.hDC == nullptr) {
+            return;
+        }
+
+        const int oldPrintColourMode = static_cast<int>(EditorSend(SCI_GETPRINTCOLOURMODE));
+        const int oldPrintWrapMode = static_cast<int>(EditorSend(SCI_GETPRINTWRAPMODE));
+        const sptr_t oldLineNumberMarginWidth = EditorSend(SCI_GETMARGINWIDTHN, 0);
+        const sptr_t oldSpacerMarginWidth = EditorSend(SCI_GETMARGINWIDTHN, 1);
+        EditorSend(SCI_SETPRINTCOLOURMODE, SC_PRINT_BLACKONWHITE);
+        EditorSend(SCI_SETPRINTWRAPMODE, SC_WRAP_WORD);
+        EditorSend(SCI_SETMARGINWIDTHN, 0, 0);
+        EditorSend(SCI_SETMARGINWIDTHN, 1, 0);
+
+        const std::wstring documentName = currentPath_.empty() ? L"Untitled" : FileNameFromPath(currentPath_);
+        DOCINFOW documentInfo = {};
+        documentInfo.cbSize = sizeof(documentInfo);
+        documentInfo.lpszDocName = documentName.c_str();
+
+        bool printFailed = false;
+        if (::StartDocW(printDialog.hDC, &documentInfo) > 0) {
+            const int pageWidth = ::GetDeviceCaps(printDialog.hDC, HORZRES);
+            const int pageHeight = ::GetDeviceCaps(printDialog.hDC, VERTRES);
+            const int marginX = ::GetDeviceCaps(printDialog.hDC, LOGPIXELSX) / 2;
+            const int marginY = ::GetDeviceCaps(printDialog.hDC, LOGPIXELSY) / 2;
+            const sptr_t documentLength = EditorSend(SCI_GETLENGTH);
+
+            Sci_RangeToFormatFull formatRange = {};
+            formatRange.hdc = printDialog.hDC;
+            formatRange.hdcTarget = printDialog.hDC;
+            formatRange.rcPage.left = 0;
+            formatRange.rcPage.top = 0;
+            formatRange.rcPage.right = pageWidth;
+            formatRange.rcPage.bottom = pageHeight;
+            formatRange.rc.left = marginX;
+            formatRange.rc.top = marginY;
+            formatRange.rc.right = std::max(marginX, pageWidth - marginX);
+            formatRange.rc.bottom = std::max(marginY, pageHeight - marginY);
+            formatRange.chrg.cpMin = 0;
+            formatRange.chrg.cpMax = documentLength;
+
+            while (!printFailed && formatRange.chrg.cpMin < documentLength) {
+                if (::StartPage(printDialog.hDC) <= 0) {
+                    printFailed = true;
+                    break;
+                }
+
+                const sptr_t nextPosition = EditorSend(
+                    SCI_FORMATRANGEFULL,
+                    TRUE,
+                    reinterpret_cast<sptr_t>(&formatRange));
+                if (::EndPage(printDialog.hDC) <= 0) {
+                    printFailed = true;
+                    break;
+                }
+                if (nextPosition <= formatRange.chrg.cpMin) {
+                    printFailed = true;
+                    break;
+                }
+                formatRange.chrg.cpMin = nextPosition;
+            }
+
+            EditorSend(SCI_FORMATRANGEFULL, FALSE, 0);
+            if (printFailed) {
+                ::AbortDoc(printDialog.hDC);
+            } else {
+                ::EndDoc(printDialog.hDC);
+            }
+        }
+
+        EditorSend(SCI_SETPRINTCOLOURMODE, oldPrintColourMode);
+        EditorSend(SCI_SETPRINTWRAPMODE, oldPrintWrapMode);
+        EditorSend(SCI_SETMARGINWIDTHN, 0, oldLineNumberMarginWidth);
+        EditorSend(SCI_SETMARGINWIDTHN, 1, oldSpacerMarginWidth);
+        ::DeleteDC(printDialog.hDC);
+        if (printDialog.hDevMode != nullptr) {
+            ::GlobalFree(printDialog.hDevMode);
+        }
+        if (printDialog.hDevNames != nullptr) {
+            ::GlobalFree(printDialog.hDevNames);
+        }
     }
 
     HWND CreateSearchChild(
@@ -2153,7 +2564,7 @@ private:
             SCI_TEXTWIDTH,
             STYLE_LINENUMBER,
             reinterpret_cast<sptr_t>(sample.c_str()));
-        EditorSend(SCI_SETMARGINWIDTHN, 0, width);
+        EditorSend(SCI_SETMARGINWIDTHN, 0, width + kLineNumberTextPadding);
         EditorSend(SCI_SETMARGINWIDTHN, 1, kLineNumberSpacerWidth);
     }
 
@@ -2166,31 +2577,41 @@ private:
         const sptr_t line = EditorSend(SCI_LINEFROMPOSITION, position);
         const sptr_t column = EditorSend(SCI_GETCOLUMN, position);
         const sptr_t lineCount = std::max<sptr_t>(1, EditorSend(SCI_GETLINECOUNT));
-        const wchar_t *eol = L"CRLF";
+        const sptr_t documentLength = EditorSend(SCI_GETLENGTH);
+        const wchar_t *eol = L"Windows (CRLF)";
         switch (EditorSend(SCI_GETEOLMODE)) {
         case SC_EOL_LF:
-            eol = L"LF";
+            eol = L"Unix (LF)";
             break;
         case SC_EOL_CR:
-            eol = L"CR";
+            eol = L"Macintosh (CR)";
             break;
         default:
             break;
         }
 
         const wchar_t *encoding = writeUtf8Bom_ ? L"UTF-8 BOM" : L"UTF-8";
-        wchar_t buffer[256] = {};
+        wchar_t positionBuffer[64] = {};
+        wchar_t documentSizeBuffer[96] = {};
+        wchar_t textFormatBuffer[96] = {};
+        wchar_t fontBuffer[128] = {};
         swprintf_s(
-            buffer,
-            L"  Ln %lld/%lld   Col %lld   %s   %s   %s %d",
-            static_cast<long long>(line + 1),
-            static_cast<long long>(lineCount),
+            positionBuffer,
+            L"%lld : %lld",
             static_cast<long long>(column + 1),
-            eol,
-            encoding,
-            editorFontFace_.c_str(),
-            CurrentEditorPointSize());
-        ::SetWindowTextW(statusBar_, buffer);
+            static_cast<long long>(line + 1));
+        swprintf_s(
+            documentSizeBuffer,
+            L"%lld bytes, %lld lines",
+            static_cast<long long>(documentLength),
+            static_cast<long long>(lineCount));
+        swprintf_s(textFormatBuffer, L"%s, %s", encoding, eol);
+        swprintf_s(fontBuffer, L"%s %d", editorFontFace_.c_str(), CurrentEditorPointSize());
+
+        SetStatusFieldText(statusPosition_, showStatusPosition_, positionBuffer);
+        SetStatusFieldText(statusDocumentSize_, showStatusDocumentSize_, documentSizeBuffer);
+        SetStatusFieldText(statusTextFormat_, showStatusTextFormat_, textFormatBuffer);
+        SetStatusFieldText(statusFontInfo_, showStatusFont_, fontBuffer);
     }
 
     void UpdateWindowTitle() {
@@ -2208,6 +2629,16 @@ private:
 
         ::CheckMenuItem(menu, ID_VIEW_LINE_NUMBERS, MF_BYCOMMAND | (showLineNumbers_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_VIEW_STATUS_BAR, MF_BYCOMMAND | (showStatusBar_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(menu, ID_VIEW_STATUS_POSITION, MF_BYCOMMAND | (showStatusPosition_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(
+            menu,
+            ID_VIEW_STATUS_DOCUMENT_SIZE,
+            MF_BYCOMMAND | (showStatusDocumentSize_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(
+            menu,
+            ID_VIEW_STATUS_TEXT_FORMAT,
+            MF_BYCOMMAND | (showStatusTextFormat_ ? MF_CHECKED : MF_UNCHECKED));
+        ::CheckMenuItem(menu, ID_VIEW_STATUS_FONT, MF_BYCOMMAND | (showStatusFont_ ? MF_CHECKED : MF_UNCHECKED));
         ::CheckMenuItem(menu, ID_VIEW_WORD_WRAP, MF_BYCOMMAND | (wordWrapEnabled_ ? MF_CHECKED : MF_UNCHECKED));
         UINT styleCommandId = ID_VIEW_STYLE_SYSTEM;
         switch (styleMode_) {
@@ -2240,7 +2671,7 @@ private:
 
 }  // namespace
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int showCommand) {
     FedWindow app(instance);
-    return app.Run(showCommand);
+    return app.Run(showCommand, InitialPathFromCommandLine(commandLine));
 }
