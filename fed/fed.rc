@@ -12,6 +12,7 @@ BEGIN
         MENUITEM "&Open...\tCtrl+O",  ID_FILE_OPEN
         MENUITEM "&Save\tCtrl+S",     ID_FILE_SAVE
         MENUITEM "Save &As...\tCtrl+Shift+S", ID_FILE_SAVE_AS
+        MENUITEM "&Print...\tCtrl+P", ID_FILE_PRINT
         MENUITEM SEPARATOR
         MENUITEM "E&xit",             ID_FILE_EXIT
     END
@@ -32,8 +33,15 @@ BEGIN
     POPUP "&View"
     BEGIN
         MENUITEM "&Line Numbers",     ID_VIEW_LINE_NUMBERS, CHECKED
-        MENUITEM "&Status Bar",       ID_VIEW_STATUS_BAR, CHECKED
         MENUITEM "&Word Wrap",        ID_VIEW_WORD_WRAP
+        POPUP "&Status Bar"
+        BEGIN
+            MENUITEM "&Enable",       ID_VIEW_STATUS_BAR, CHECKED
+            MENUITEM "&Position",     ID_VIEW_STATUS_POSITION, CHECKED
+            MENUITEM "&Document size", ID_VIEW_STATUS_DOCUMENT_SIZE, CHECKED
+            MENUITEM "&Text file format", ID_VIEW_STATUS_TEXT_FORMAT, CHECKED
+            MENUITEM "&Font",         ID_VIEW_STATUS_FONT, CHECKED
+        END
         POPUP "&Style"
         BEGIN
             MENUITEM "&System",       ID_VIEW_STYLE_SYSTEM, CHECKED
@@ -53,6 +61,7 @@ BEGIN
     "O", ID_FILE_OPEN, VIRTKEY, CONTROL
     "S", ID_FILE_SAVE, VIRTKEY, CONTROL
     "S", ID_FILE_SAVE_AS, VIRTKEY, CONTROL, SHIFT
+    "P", ID_FILE_PRINT, VIRTKEY, CONTROL
     "Z", ID_EDIT_UNDO, VIRTKEY, CONTROL
     "X", ID_EDIT_CUT, VIRTKEY, CONTROL
     "C", ID_EDIT_COPY, VIRTKEY, CONTROL

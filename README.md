@@ -23,3 +23,5 @@ It focuses on a small, practical feature set:
 - `Ctrl++` - Zoom In
 - `Ctrl+-` - Zoom Out
 - `Ctrl+0` - Reset Zoom
+- `Alt+Up` - Move line/selection up
+- `Alt+Down` - Move line/selection up
