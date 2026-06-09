@@ -10,6 +10,7 @@ It focuses on a small, practical feature set:
 - Zooming
 - Search and replace
 - Light and dark theme modes
+- Full screen mode
 
 ## Keyboard Shortcuts
 
@@ -24,4 +25,5 @@ It focuses on a small, practical feature set:
 - `Ctrl+-` - Zoom Out
 - `Ctrl+0` - Reset Zoom
 - `Alt+Up` - Move line/selection up
-- `Alt+Down` - Move line/selection up
+- `Alt+Down` - Move line/selection down
+- `Alt+Enter` - Toggle full screen

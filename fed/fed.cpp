@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cwchar>
 #include <limits>
 #include <string>
@@ -346,6 +347,32 @@ bool TextValueIsTrue(std::string_view value) {
     return value == "1" || value == "true" || value == "True" || value == "yes" || value == "Yes";
 }
 
+int ParseInt(std::string_view value, int fallback) {
+    std::string text(value);
+    char *end = nullptr;
+    const long parsed = std::strtol(text.c_str(), &end, 10);
+    if (end == text.c_str()) {
+        return fallback;
+    }
+    return static_cast<int>(parsed);
+}
+
+int ClampPointSize(int pointSize) {
+    return std::clamp(pointSize, 6, 72);
+}
+
+int ParsePointSize(std::string_view value, int fallback) {
+    const int parsed = ParseInt(value, fallback);
+    if (parsed <= 0 || parsed > 1000) {
+        return fallback;
+    }
+    return ClampPointSize(parsed);
+}
+
+int ClampFontWeight(int weight) {
+    return std::clamp(weight, FW_THIN, FW_HEAVY);
+}
+
 bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring *errorMessage) {
     UniqueHandle file(::CreateFileW(
         path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
@@ -545,7 +572,12 @@ LRESULT CALLBACK StatusBarSubclassProc(
     UINT_PTR,
     DWORD_PTR) {
     switch (message) {
+    case WM_CTLCOLORSTATIC:
+        return ::SendMessageW(::GetAncestor(window, GA_ROOT), message, wParam, lParam);
     case WM_LBUTTONDOWN:
+        if ((::GetWindowLongPtrW(::GetAncestor(window, GA_ROOT), GWL_STYLE) & WS_CAPTION) == 0) {
+            return 0;
+        }
         ::ReleaseCapture();
         ::SendMessageW(::GetAncestor(window, GA_ROOT), WM_NCLBUTTONDOWN, HTCAPTION, 0);
         return 0;
@@ -582,9 +614,11 @@ public:
         const HRESULT oleResult = ::OleInitialize(nullptr);
         const bool oleInitialized = SUCCEEDED(oleResult);
 
-        LoadSettings();
         editorFontFace_ = SelectEditorFont();
-        statusFont_ = CreateUiFont(editorFontFace_, 11, FW_NORMAL);
+        lineNumberFontFace_ = editorFontFace_;
+        statusFontFace_ = editorFontFace_;
+        LoadSettings();
+        statusFont_ = CreateUiFont(statusFontFace_, statusBarFontSize_, FW_NORMAL);
         searchFont_ = CreateMessageFont();
         darkModeEnabled_ = ResolveDarkModeEnabled();
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
@@ -650,6 +684,8 @@ private:
     HFONT searchFont_ = nullptr;
     std::wstring currentPath_;
     std::wstring editorFontFace_;
+    std::wstring lineNumberFontFace_;
+    std::wstring statusFontFace_;
     HWND findWindow_ = nullptr;
     HWND replaceWindow_ = nullptr;
     std::wstring searchText_;
@@ -673,6 +709,15 @@ private:
     bool showStatusTextFormat_ = true;
     bool showStatusFont_ = true;
     bool wordWrapEnabled_ = false;
+    int editorFontPointSize_ = kDefaultEditorFontSize;
+    int editorFontWeight_ = FW_NORMAL;
+    bool editorFontItalic_ = false;
+    int statusBarFontSize_ = 11;
+    bool fullScreen_ = false;
+    DWORD savedWindowStyle_ = 0;
+    DWORD savedWindowExStyle_ = 0;
+    WINDOWPLACEMENT savedWindowPlacement_ = {sizeof(WINDOWPLACEMENT)};
+    HMENU savedWindowMenu_ = nullptr;
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
         FedWindow *self = nullptr;
@@ -751,6 +796,10 @@ private:
     void DestroyUiResources() {
         DestroySearchWindow(findWindow_);
         DestroySearchWindow(replaceWindow_);
+        if (savedWindowMenu_ != nullptr) {
+            ::DestroyMenu(savedWindowMenu_);
+            savedWindowMenu_ = nullptr;
+        }
         if (searchFont_ != nullptr && searchFont_ != ::GetStockObject(DEFAULT_GUI_FONT)) {
             ::DeleteObject(searchFont_);
             searchFont_ = nullptr;
@@ -783,7 +832,9 @@ private:
                 ::DestroyWindow(::GetAncestor(message->hwnd, GA_ROOT));
                 return true;
             }
-            if (message->wParam == VK_RETURN && IsSearchWindow(message->hwnd)) {
+            if (message->wParam == VK_RETURN &&
+                (::GetKeyState(VK_MENU) & 0x8000) == 0 &&
+                IsSearchWindow(message->hwnd)) {
                 HWND restoreFocus = message->hwnd;
                 SelectSearchMatch(true);
                 if (restoreFocus != nullptr && ::IsWindow(restoreFocus)) {
@@ -961,10 +1012,10 @@ private:
         }
         ::SendMessageW(statusBar_, WM_SETFONT, reinterpret_cast<WPARAM>(statusFont_), TRUE);
         ::SetWindowSubclass(statusBar_, StatusBarSubclassProc, 0, 0);
-        statusPosition_ = CreateStatusField(window_);
-        statusDocumentSize_ = CreateStatusField(window_);
-        statusTextFormat_ = CreateStatusField(window_);
-        statusFontInfo_ = CreateStatusField(window_);
+        statusPosition_ = CreateStatusField(statusBar_);
+        statusDocumentSize_ = CreateStatusField(statusBar_);
+        statusTextFormat_ = CreateStatusField(statusBar_);
+        statusFontInfo_ = CreateStatusField(statusBar_);
 
         ApplyDarkMode();
         ConfigureEditor();
@@ -1029,7 +1080,7 @@ private:
         return size.cx + kStatusFieldPadding;
     }
 
-    void LayoutStatusField(HWND field, bool visible, int top, int *left, int width) {
+    void LayoutStatusField(HWND field, bool visible, int *left, int width) {
         if (field == nullptr || left == nullptr) {
             return;
         }
@@ -1038,7 +1089,7 @@ private:
             return;
         }
 
-        ::MoveWindow(field, *left, top, width, kStatusHeight, TRUE);
+        ::MoveWindow(field, *left, 0, width, kStatusHeight, TRUE);
         ::SetWindowPos(field, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         ::ShowWindow(field, SW_SHOW);
         ::RedrawWindow(field, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
@@ -1051,24 +1102,18 @@ private:
         }
 
         int left = kStatusLeftPadding;
-        RECT statusRect = {};
-        ::GetWindowRect(statusBar_, &statusRect);
-        ::MapWindowPoints(HWND_DESKTOP, window_, reinterpret_cast<POINT *>(&statusRect), 2);
-
-        LayoutStatusField(statusPosition_, showStatusPosition_, statusRect.top, &left, MeasureStatusText(L"99999 : 99999"));
+        LayoutStatusField(statusPosition_, showStatusPosition_, &left, MeasureStatusText(L"99999 : 99999"));
         LayoutStatusField(
             statusDocumentSize_,
             showStatusDocumentSize_,
-            statusRect.top,
             &left,
             MeasureStatusText(L"99,999,999 bytes, 99,999 lines"));
         LayoutStatusField(
             statusTextFormat_,
             showStatusTextFormat_,
-            statusRect.top,
             &left,
             MeasureStatusText(L"UTF-8 BOM, Macintosh (CR)"));
-        LayoutStatusField(statusFontInfo_, showStatusFont_, statusRect.top, &left, MeasureStatusText(editorFontFace_ + L" 99"));
+        LayoutStatusField(statusFontInfo_, showStatusFont_, &left, MeasureStatusText(editorFontFace_ + L" 99"));
         ::RedrawWindow(statusBar_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
     }
 
@@ -1147,6 +1192,12 @@ private:
         case ID_EDIT_SELECT_ALL:
             EditorSend(SCI_SELECTALL);
             break;
+        case ID_EDIT_FONT:
+            PromptForEditorFont();
+            break;
+        case ID_EDIT_RESET_FONT:
+            ResetEditorFont();
+            break;
         case ID_VIEW_LINE_NUMBERS:
             showLineNumbers_ = !showLineNumbers_;
             UpdateLineNumberMargin();
@@ -1204,6 +1255,9 @@ private:
             break;
         case ID_VIEW_ZOOM_RESET:
             EditorSend(SCI_SETZOOM, 0);
+            break;
+        case ID_VIEW_FULL_SCREEN:
+            ToggleFullScreen();
             break;
         case ID_HELP_ABOUT:
             ShowAboutDialog();
@@ -1312,6 +1366,8 @@ private:
         setState(ID_EDIT_PASTE, canPaste);
         setState(ID_EDIT_FIND, true);
         setState(ID_EDIT_REPLACE, true);
+        setState(ID_EDIT_FONT, true);
+        setState(ID_EDIT_RESET_FONT, true);
         UpdateMenuChecks();
     }
 
@@ -1431,15 +1487,24 @@ private:
 
         const EditorPalette palette = PaletteForDarkMode(darkModeEnabled_);
         const std::string fontName = WideToUtf8(editorFontFace_);
+        const std::string lineNumberFontName = WideToUtf8(lineNumberFontFace_);
 
         EditorSend(SCI_STYLESETFORE, STYLE_DEFAULT, palette.fore);
         EditorSend(SCI_STYLESETBACK, STYLE_DEFAULT, palette.back);
-        EditorSend(SCI_STYLESETSIZE, STYLE_DEFAULT, kDefaultEditorFontSize);
+        EditorSend(SCI_STYLESETSIZE, STYLE_DEFAULT, editorFontPointSize_);
         EditorSend(SCI_STYLESETFONT, STYLE_DEFAULT, reinterpret_cast<sptr_t>(fontName.c_str()));
+        EditorSend(SCI_STYLESETWEIGHT, STYLE_DEFAULT, editorFontWeight_);
+        EditorSend(SCI_STYLESETBOLD, STYLE_DEFAULT, editorFontWeight_ >= FW_SEMIBOLD);
+        EditorSend(SCI_STYLESETITALIC, STYLE_DEFAULT, editorFontItalic_ ? 1 : 0);
         EditorSend(SCI_STYLECLEARALL);
 
         EditorSend(SCI_STYLESETFORE, STYLE_LINENUMBER, palette.gutterFore);
         EditorSend(SCI_STYLESETBACK, STYLE_LINENUMBER, palette.gutterBack);
+        EditorSend(SCI_STYLESETSIZE, STYLE_LINENUMBER, editorFontPointSize_);
+        EditorSend(SCI_STYLESETFONT, STYLE_LINENUMBER, reinterpret_cast<sptr_t>(lineNumberFontName.c_str()));
+        EditorSend(SCI_STYLESETWEIGHT, STYLE_LINENUMBER, SC_WEIGHT_NORMAL);
+        EditorSend(SCI_STYLESETBOLD, STYLE_LINENUMBER, 0);
+        EditorSend(SCI_STYLESETITALIC, STYLE_LINENUMBER, 0);
         EditorSend(SCI_SETMARGINBACKN, 1, palette.back);
 
         EditorSend(SCI_SETSELFORE, 1, palette.fore);
@@ -1464,7 +1529,7 @@ private:
         UpdateSearchBrushes();
         ApplyDarkMode();
         ApplyEditorAppearance();
-        UpdateStatusBar();
+        RefreshStatusBar();
         UpdateMenuChecks();
     }
 
@@ -1519,7 +1584,7 @@ private:
         UpdateSearchBrushes();
         ApplyDarkMode();
         ApplyEditorAppearance();
-        UpdateStatusBar();
+        RefreshStatusBar();
         UpdateMenuChecks();
     }
 
@@ -1735,6 +1800,151 @@ private:
         return path;
     }
 
+    void ApplyEditorFontSelection(bool resetZoom) {
+        if (editor_ == nullptr) {
+            return;
+        }
+
+        if (resetZoom) {
+            EditorSend(SCI_SETZOOM, 0);
+        }
+        ApplyEditorAppearance();
+        UpdateLineNumberMargin();
+        LayoutStatusBarFields();
+        UpdateStatusBar();
+        RestoreEditorFocus();
+    }
+
+    void PromptForEditorFont() {
+        LOGFONTW logFont = {};
+        logFont.lfHeight = -::MulDiv(editorFontPointSize_, ::GetDpiForWindow(window_), 72);
+        logFont.lfWeight = editorFontWeight_;
+        logFont.lfItalic = editorFontItalic_ ? TRUE : FALSE;
+        logFont.lfCharSet = DEFAULT_CHARSET;
+        logFont.lfPitchAndFamily = FIXED_PITCH | FF_MODERN;
+        wcsncpy_s(logFont.lfFaceName, editorFontFace_.c_str(), _TRUNCATE);
+
+        CHOOSEFONTW chooseFont = {};
+        chooseFont.lStructSize = sizeof(chooseFont);
+        chooseFont.hwndOwner = window_;
+        chooseFont.lpLogFont = &logFont;
+        chooseFont.iPointSize = editorFontPointSize_ * 10;
+        chooseFont.Flags = CF_SCREENFONTS | CF_INITTOLOGFONTSTRUCT | CF_FORCEFONTEXIST;
+        chooseFont.rgbColors = RGB(0, 0, 0);
+
+        if (!::ChooseFontW(&chooseFont)) {
+            RestoreEditorFocus();
+            return;
+        }
+
+        editorFontFace_ = logFont.lfFaceName;
+        editorFontWeight_ = ClampFontWeight(logFont.lfWeight);
+        editorFontItalic_ = logFont.lfItalic != FALSE;
+        if (chooseFont.iPointSize > 0) {
+            editorFontPointSize_ = ClampPointSize((chooseFont.iPointSize + 5) / 10);
+        }
+        ApplyEditorFontSelection(true);
+    }
+
+    void ResetEditorFont() {
+        editorFontFace_ = SelectEditorFont();
+        editorFontPointSize_ = kDefaultEditorFontSize;
+        editorFontWeight_ = FW_NORMAL;
+        editorFontItalic_ = false;
+        ApplyEditorFontSelection(true);
+    }
+
+    void RefreshStatusBar() {
+        LayoutStatusBarFields();
+        UpdateStatusBar();
+        if (statusBar_ != nullptr) {
+            ::RedrawWindow(statusBar_, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+        }
+        const std::array<HWND, 4> fields = {
+            statusPosition_,
+            statusDocumentSize_,
+            statusTextFormat_,
+            statusFontInfo_,
+        };
+        for (HWND field : fields) {
+            if (field != nullptr && ::IsWindowVisible(field)) {
+                ::RedrawWindow(field, nullptr, nullptr, RDW_INVALIDATE | RDW_UPDATENOW);
+            }
+        }
+    }
+
+    void ToggleFullScreen() {
+        if (fullScreen_) {
+            ExitFullScreen();
+        } else {
+            EnterFullScreen();
+        }
+    }
+
+    void EnterFullScreen() {
+        if (window_ == nullptr || fullScreen_) {
+            return;
+        }
+
+        savedWindowStyle_ = static_cast<DWORD>(::GetWindowLongPtrW(window_, GWL_STYLE));
+        savedWindowExStyle_ = static_cast<DWORD>(::GetWindowLongPtrW(window_, GWL_EXSTYLE));
+        savedWindowPlacement_.length = sizeof(savedWindowPlacement_);
+        ::GetWindowPlacement(window_, &savedWindowPlacement_);
+        savedWindowMenu_ = ::GetMenu(window_);
+
+        MONITORINFO monitorInfo = {};
+        monitorInfo.cbSize = sizeof(monitorInfo);
+        if (!::GetMonitorInfoW(::MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST), &monitorInfo)) {
+            return;
+        }
+
+        ::SetMenu(window_, nullptr);
+        ::SetWindowLongPtrW(window_, GWL_STYLE, savedWindowStyle_ & ~(WS_CAPTION | WS_THICKFRAME));
+        ::SetWindowLongPtrW(
+            window_,
+            GWL_EXSTYLE,
+            savedWindowExStyle_ & ~(WS_EX_DLGMODALFRAME | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE));
+        ::SetWindowPos(
+            window_,
+            HWND_TOP,
+            monitorInfo.rcMonitor.left,
+            monitorInfo.rcMonitor.top,
+            monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
+            monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
+            SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        ::DrawMenuBar(window_);
+        fullScreen_ = true;
+        LayoutChildren();
+        RefreshStatusBar();
+    }
+
+    void ExitFullScreen() {
+        if (window_ == nullptr || !fullScreen_) {
+            return;
+        }
+
+        ::SetWindowLongPtrW(window_, GWL_STYLE, savedWindowStyle_);
+        ::SetWindowLongPtrW(window_, GWL_EXSTYLE, savedWindowExStyle_);
+        if (savedWindowMenu_ != nullptr) {
+            ::SetMenu(window_, savedWindowMenu_);
+            savedWindowMenu_ = nullptr;
+        }
+        savedWindowPlacement_.length = sizeof(savedWindowPlacement_);
+        ::SetWindowPlacement(window_, &savedWindowPlacement_);
+        ::SetWindowPos(
+            window_,
+            nullptr,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        ::DrawMenuBar(window_);
+        fullScreen_ = false;
+        LayoutChildren();
+        RefreshStatusBar();
+    }
+
     static const char *StyleModeName(StyleMode styleMode) {
         switch (styleMode) {
         case StyleMode::Light:
@@ -1790,6 +2000,8 @@ private:
                     showLineNumbers_ = TextValueIsTrue(value);
                 } else if (key == "StatusBar") {
                     showStatusBar_ = TextValueIsTrue(value);
+                } else if (key == "StatusBarFontSize") {
+                    statusBarFontSize_ = ParsePointSize(value, statusBarFontSize_);
                 } else if (key == "StatusPosition") {
                     showStatusPosition_ = TextValueIsTrue(value);
                 } else if (key == "StatusDocumentSize") {
@@ -1802,6 +2014,17 @@ private:
                     wordWrapEnabled_ = TextValueIsTrue(value);
                 } else if (key == "Style") {
                     styleMode_ = StyleModeFromName(value, styleMode_);
+                } else if (key == "EditorFontFace") {
+                    std::wstring fontFace = Utf8ToWide(value);
+                    if (!fontFace.empty()) {
+                        editorFontFace_ = fontFace;
+                    }
+                } else if (key == "EditorFontSize") {
+                    editorFontPointSize_ = ParsePointSize(value, editorFontPointSize_);
+                } else if (key == "EditorFontWeight") {
+                    editorFontWeight_ = ClampFontWeight(ParseInt(value, editorFontWeight_));
+                } else if (key == "EditorFontItalic") {
+                    editorFontItalic_ = TextValueIsTrue(value);
                 } else if (key == "MatchCase") {
                     searchMatchCase_ = TextValueIsTrue(value);
                 } else if (key == "MatchWholeWord") {
@@ -1830,6 +2053,9 @@ private:
         contents += showLineNumbers_ ? "1\n" : "0\n";
         contents += "StatusBar=";
         contents += showStatusBar_ ? "1\n" : "0\n";
+        contents += "StatusBarFontSize=";
+        contents += std::to_string(statusBarFontSize_);
+        contents += "\n";
         contents += "StatusPosition=";
         contents += showStatusPosition_ ? "1\n" : "0\n";
         contents += "StatusDocumentSize=";
@@ -1843,6 +2069,17 @@ private:
         contents += "Style=";
         contents += StyleModeName(styleMode_);
         contents += "\n";
+        contents += "EditorFontFace=";
+        contents += WideToUtf8(editorFontFace_);
+        contents += "\n";
+        contents += "EditorFontSize=";
+        contents += std::to_string(editorFontPointSize_);
+        contents += "\n";
+        contents += "EditorFontWeight=";
+        contents += std::to_string(editorFontWeight_);
+        contents += "\n";
+        contents += "EditorFontItalic=";
+        contents += editorFontItalic_ ? "1\n" : "0\n";
         contents += "MatchCase=";
         contents += searchMatchCase_ ? "1\n" : "0\n";
         contents += "MatchWholeWord=";
@@ -2538,7 +2775,7 @@ private:
 
     int CurrentEditorPointSize() const {
         const int zoomLevel = editor_ != nullptr ? static_cast<int>(EditorSend(SCI_GETZOOM)) : 0;
-        return std::max(1, kDefaultEditorFontSize + zoomLevel);
+        return std::max(1, editorFontPointSize_ + zoomLevel);
     }
 
     void UpdateLineNumberMargin() {
