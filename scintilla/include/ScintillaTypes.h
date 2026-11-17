@@ -434,6 +434,7 @@ enum class Status {
 	Ok = 0,
 	Failure = 1,
 	BadAlloc = 2,
+	OutsideDocument = 3,
 	WarnStart = 1000,
 	RegEx = 1001,
 };
@@ -603,6 +604,8 @@ enum class Update {
 	Selection = 0x2,
 	VScroll = 0x4,
 	HScroll = 0x8,
+	Text = 0x10,
+	LineCount = 0x20,
 };
 
 enum class FocusChange {
@@ -658,6 +661,11 @@ enum class CharacterSource {
 	ImeResult = 2,
 };
 
+enum class ScaleTechnique {
+	Default = 0,
+	PixelAligned = 1,
+};
+
 enum class Bidirectional {
 	Disabled = 0,
 	L2R = 1,
@@ -702,6 +710,7 @@ enum class Notification {
 
 using Position = intptr_t;
 using Line = intptr_t;
+using Pixels = int;
 using Colour = int;
 using ColourAlpha = int;
 using uptr_t = uintptr_t;
