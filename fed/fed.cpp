@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <limits>
+#include <new>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -205,7 +206,15 @@ std::wstring SystemMessageWide(DWORD error) {
 }
 
 void SetSystemErrorMessage(DWORD error, std::wstring *errorMessage) {
-    *errorMessage = SystemMessageWide(error);
+    if (errorMessage != nullptr) {
+        *errorMessage = SystemMessageWide(error);
+    }
+}
+
+void SetErrorMessage(std::wstring *errorMessage, const wchar_t *message) {
+    if (errorMessage != nullptr) {
+        *errorMessage = message;
+    }
 }
 
 class UniqueHandle {
@@ -229,9 +238,42 @@ public:
         return handle_;
     }
 
+    void Reset(HANDLE handle = INVALID_HANDLE_VALUE) {
+        if (IsValid()) {
+            ::CloseHandle(handle_);
+        }
+        handle_ = handle;
+    }
+
+    bool Close() {
+        if (!IsValid()) {
+            return true;
+        }
+        const HANDLE handle = handle_;
+        handle_ = INVALID_HANDLE_VALUE;
+        return ::CloseHandle(handle) != FALSE;
+    }
+
 private:
     HANDLE handle_ = INVALID_HANDLE_VALUE;
 };
+
+std::wstring FullPathFromPath(const std::wstring &path) {
+    if (path.empty()) {
+        return {};
+    }
+    const DWORD required = ::GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0) {
+        return path;
+    }
+    std::wstring fullPath(required, L'\0');
+    const DWORD copied = ::GetFullPathNameW(path.c_str(), required, fullPath.data(), nullptr);
+    if (copied == 0 || copied >= required) {
+        return path;
+    }
+    fullPath.resize(copied);
+    return fullPath;
+}
 
 std::wstring DirectoryFromPath(const std::wstring &path) {
     const size_t separator = path.find_last_of(L"\\/");
@@ -247,6 +289,14 @@ std::wstring FileNameFromPath(const std::wstring &path) {
         return path;
     }
     return path.substr(separator + 1);
+}
+
+std::wstring ExtensionFromFileName(const std::wstring &fileName) {
+    const size_t dot = fileName.find_last_of(L'.');
+    if (dot == std::wstring::npos || dot == 0 || dot + 1 >= fileName.size()) {
+        return {};
+    }
+    return fileName.substr(dot + 1);
 }
 
 std::wstring InitialPathFromCommandLine(PWSTR commandLine) {
@@ -417,35 +467,195 @@ bool ReadAllBytes(const std::wstring &path, std::string *contents, std::wstring 
     return true;
 }
 
-bool WriteAllBytes(const std::wstring &path, const std::string &contents, std::wstring *errorMessage) {
-    UniqueHandle file(::CreateFileW(
-        path.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr));
-    if (!file.IsValid()) {
-        SetSystemErrorMessage(::GetLastError(), errorMessage);
-        return false;
-    }
-
+bool WriteBufferToHandle(HANDLE file, std::string_view data, std::wstring *errorMessage) {
     size_t totalWritten = 0;
     BOOL ok = TRUE;
-    while (ok && totalWritten < contents.size()) {
-        const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(contents.size() - totalWritten, 1u << 20));
+    while (ok && totalWritten < data.size()) {
+        const DWORD chunkSize = static_cast<DWORD>(std::min<size_t>(data.size() - totalWritten, 1u << 20));
         DWORD written = 0;
-        ok = ::WriteFile(file.Get(), contents.data() + totalWritten, chunkSize, &written, nullptr);
+        ok = ::WriteFile(file, data.data() + totalWritten, chunkSize, &written, nullptr);
         totalWritten += written;
         if (written == 0) {
             break;
         }
     }
-    if (!ok || totalWritten != contents.size()) {
+    if (!ok || totalWritten != data.size()) {
         if (!ok) {
             SetSystemErrorMessage(::GetLastError(), errorMessage);
         } else {
-            *errorMessage = L"Unable to write the complete file.";
+            SetErrorMessage(errorMessage, L"Unable to write the complete file.");
         }
+        return false;
+    }
+    return true;
+}
+
+bool WriteAllBytesInPlace(
+    const std::wstring &path,
+    std::string_view prefix,
+    std::string_view contents,
+    std::wstring *errorMessage) {
+    UniqueHandle file(::CreateFileW(
+        path.c_str(),
+        GENERIC_WRITE,
+        FILE_SHARE_READ,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr));
+    if (!file.IsValid()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
+        return false;
+    }
+
+    if (!WriteBufferToHandle(file.Get(), prefix, errorMessage) ||
+        !WriteBufferToHandle(file.Get(), contents, errorMessage)) {
+        return false;
+    }
+
+    if (!::SetEndOfFile(file.Get()) || !::FlushFileBuffers(file.Get())) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
+        return false;
+    }
+
+    if (!file.Close()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
         return false;
     }
 
     return true;
+}
+
+bool WriteAllBytes(
+    const std::wstring &path,
+    std::string_view prefix,
+    std::string_view contents,
+    std::wstring *errorMessage) {
+    const std::wstring fullPath = FullPathFromPath(path);
+    const std::wstring directory = DirectoryFromPath(fullPath);
+    if (fullPath.empty() || directory.empty()) {
+        SetErrorMessage(errorMessage, L"Invalid file path.");
+        return false;
+    }
+
+    const DWORD targetAttributes = ::GetFileAttributesW(fullPath.c_str());
+    bool targetExists = false;
+    if (targetAttributes != INVALID_FILE_ATTRIBUTES) {
+        if ((targetAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+            SetSystemErrorMessage(ERROR_ACCESS_DENIED, errorMessage);
+            return false;
+        }
+        targetExists = true;
+    }
+
+    const DWORD processId = ::GetCurrentProcessId();
+    const ULONGLONG tickCount = ::GetTickCount64();
+    std::wstring tempPath;
+    UniqueHandle tempFile;
+    DWORD createError = ERROR_SUCCESS;
+    for (unsigned int attempt = 0; attempt < 64; ++attempt) {
+        tempPath = directory + L"\\fed-" + std::to_wstring(processId) + L"-" +
+            std::to_wstring(tickCount) + L"-" + std::to_wstring(attempt) + L".tmp";
+        const HANDLE candidate = ::CreateFileW(
+            tempPath.c_str(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ,
+            nullptr,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            nullptr);
+        if (candidate != INVALID_HANDLE_VALUE) {
+            tempFile.Reset(candidate);
+            createError = ERROR_SUCCESS;
+            break;
+        }
+        createError = ::GetLastError();
+        if (createError != ERROR_FILE_EXISTS) {
+            break;
+        }
+    }
+
+    if (!tempFile.IsValid()) {
+        if (targetExists && createError == ERROR_ACCESS_DENIED) {
+            return WriteAllBytesInPlace(fullPath, prefix, contents, errorMessage);
+        }
+        SetSystemErrorMessage(createError, errorMessage);
+        return false;
+    }
+
+    auto cleanupTemp = [&]() {
+        tempFile.Close();
+        ::DeleteFileW(tempPath.c_str());
+    };
+
+    if (!WriteBufferToHandle(tempFile.Get(), prefix, errorMessage) ||
+        !WriteBufferToHandle(tempFile.Get(), contents, errorMessage)) {
+        cleanupTemp();
+        return false;
+    }
+
+    if (!::FlushFileBuffers(tempFile.Get())) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
+        cleanupTemp();
+        return false;
+    }
+
+    if (!tempFile.Close()) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
+        ::DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (targetExists) {
+        if (::ReplaceFileW(
+                fullPath.c_str(),
+                tempPath.c_str(),
+                nullptr,
+                REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS,
+                nullptr,
+                nullptr)) {
+            return true;
+        }
+
+        const DWORD replaceError = ::GetLastError();
+        if (replaceError == ERROR_FILE_NOT_FOUND ||
+            replaceError == ERROR_NOT_SUPPORTED ||
+            replaceError == ERROR_INVALID_FUNCTION) {
+            if (::MoveFileExW(
+                    tempPath.c_str(),
+                    fullPath.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                const DWORD preservedAttributes =
+                    targetAttributes & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM | FILE_ATTRIBUTE_ARCHIVE);
+                if (preservedAttributes != 0) {
+                    ::SetFileAttributesW(fullPath.c_str(), preservedAttributes);
+                }
+                return true;
+            }
+            SetSystemErrorMessage(::GetLastError(), errorMessage);
+            ::DeleteFileW(tempPath.c_str());
+            return false;
+        }
+
+        SetSystemErrorMessage(replaceError, errorMessage);
+        ::DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    if (!::MoveFileExW(
+            tempPath.c_str(),
+            fullPath.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        SetSystemErrorMessage(::GetLastError(), errorMessage);
+        ::DeleteFileW(tempPath.c_str());
+        return false;
+    }
+
+    return true;
+}
+
+bool WriteAllBytes(const std::wstring &path, std::string_view contents, std::wstring *errorMessage) {
+    return WriteAllBytes(path, {}, contents, errorMessage);
 }
 
 int DetectEolMode(std::string_view text) {
@@ -1674,7 +1884,7 @@ private:
 
         EditorSend(SCI_SETTEXT, 0, reinterpret_cast<sptr_t>(document.utf8Text.c_str()));
         writeUtf8Bom_ = document.hadUtf8Bom;
-        currentPath_ = path;
+        currentPath_ = FullPathFromPath(path);
 
         EditorSend(SCI_SETEOLMODE, document.eolMode);
         EditorSend(SCI_EMPTYUNDOBUFFER);
@@ -1704,20 +1914,15 @@ private:
             return false;
         }
 
-        std::string bytes;
-        if (writeUtf8Bom_) {
-            bytes.assign("\xEF\xBB\xBF", 3);
-        }
-        bytes.append(text);
-
+        const std::string_view bom = writeUtf8Bom_ ? std::string_view("\xEF\xBB\xBF", 3) : std::string_view();
         std::wstring errorMessage;
-        if (!WriteAllBytes(targetPath, bytes, &errorMessage)) {
+        if (!WriteAllBytes(targetPath, bom, text, &errorMessage)) {
             std::wstring message = L"Unable to save file:\n\n" + targetPath + L"\n\n" + errorMessage;
             ::MessageBoxW(window_, message.c_str(), kAppName, MB_ICONERROR | MB_OK);
             return false;
         }
 
-        currentPath_ = targetPath;
+        currentPath_ = FullPathFromPath(targetPath);
         EditorSend(SCI_SETSAVEPOINT);
         UpdateStatusBar();
         UpdateWindowTitle();
@@ -1763,6 +1968,7 @@ private:
             CLSCTX_INPROC_SERVER,
             IID_PPV_ARGS(&dialog));
         if (FAILED(result)) {
+            ::MessageBoxW(window_, L"Unable to open the file dialog.", kAppName, MB_ICONERROR | MB_OK);
             return {};
         }
 
@@ -1772,18 +1978,38 @@ private:
             {L"All Files (*.*)", L"*.*"},
         };
         dialog->SetFileTypes(ARRAYSIZE(filters), filters);
-        dialog->SetFileTypeIndex(1);
-        dialog->SetDefaultExtension(L"txt");
+
+        if (open) {
+            dialog->SetFileTypeIndex(1);
+            dialog->SetDefaultExtension(L"txt");
+        } else if (currentPath_.empty()) {
+            dialog->SetFileTypeIndex(1);
+            dialog->SetDefaultExtension(L"txt");
+        } else {
+            const std::wstring extension = ExtensionFromFileName(FileNameFromPath(currentPath_));
+            if (::_wcsicmp(extension.c_str(), L"txt") == 0) {
+                dialog->SetFileTypeIndex(1);
+                dialog->SetDefaultExtension(L"txt");
+            } else if (::_wcsicmp(extension.c_str(), L"srt") == 0 ||
+                       ::_wcsicmp(extension.c_str(), L"ini") == 0 ||
+                       ::_wcsicmp(extension.c_str(), L"bat") == 0) {
+                dialog->SetFileTypeIndex(2);
+                dialog->SetDefaultExtension(extension.c_str());
+            } else {
+                dialog->SetFileTypeIndex(3);
+            }
+        }
 
         DWORD options = 0;
         if (SUCCEEDED(dialog->GetOptions(&options))) {
-            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+            options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR;
             options |= open ? FOS_FILEMUSTEXIST : FOS_OVERWRITEPROMPT;
             dialog->SetOptions(options);
         }
 
         if (!currentPath_.empty()) {
-            const std::wstring directory = DirectoryFromPath(currentPath_);
+            const std::wstring resolvedPath = FullPathFromPath(currentPath_);
+            const std::wstring directory = DirectoryFromPath(resolvedPath);
             if (!directory.empty()) {
                 IShellItem *folder = nullptr;
                 if (SUCCEEDED(::SHCreateItemFromParsingName(directory.c_str(), nullptr, IID_PPV_ARGS(&folder)))) {
@@ -1791,7 +2017,7 @@ private:
                     folder->Release();
                 }
             }
-            dialog->SetFileName(FileNameFromPath(currentPath_).c_str());
+            dialog->SetFileName(FileNameFromPath(resolvedPath).c_str());
         }
 
         std::wstring path;
@@ -1806,6 +2032,8 @@ private:
                 }
                 item->Release();
             }
+        } else if (result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) {
+            ::MessageBoxW(window_, L"Unable to open the file dialog.", kAppName, MB_ICONERROR | MB_OK);
         }
 
         dialog->Release();
@@ -2774,13 +3002,36 @@ private:
     }
 
     bool ExtractEditorText(std::string *text) const {
-        const sptr_t length = EditorSend(SCI_GETLENGTH);
-        text->assign(static_cast<size_t>(length) + 1, '\0');
-        if (length > 0) {
-            EditorSend(SCI_GETTEXT, length + 1, reinterpret_cast<sptr_t>(text->data()));
-        } else {
-            (*text)[0] = '\0';
+        if (editor_ == nullptr || text == nullptr) {
+            return false;
         }
+
+        const sptr_t length = EditorSend(SCI_GETLENGTH);
+        if (length < 0) {
+            text->clear();
+            return false;
+        }
+        if (length == 0) {
+            text->clear();
+            return true;
+        }
+
+        try {
+            text->assign(static_cast<size_t>(length) + 1, '\0');
+        } catch (const std::bad_alloc &) {
+            text->clear();
+            return false;
+        }
+
+        const sptr_t copied = EditorSend(
+            SCI_GETTEXT,
+            static_cast<uptr_t>(length),
+            reinterpret_cast<sptr_t>(text->data()));
+        if (copied != length) {
+            text->clear();
+            return false;
+        }
+
         text->resize(static_cast<size_t>(length));
         return true;
     }
